@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "net.eventframework.test.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"mixins":[
+		"LivingEntityFallMixin"
+    ],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

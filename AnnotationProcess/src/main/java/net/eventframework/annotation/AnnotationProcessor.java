@@ -1,0 +1,736 @@
+package net.eventframework.annotation;
+
+import com.google.auto.service.AutoService;
+import com.palantir.javapoet.*;
+
+import javax.annotation.processing.*;
+import javax.lang.model.SourceVersion;
+import javax.lang.model.element.*;
+import javax.lang.model.type.MirroredTypeException;
+import javax.lang.model.type.TypeKind;
+import javax.lang.model.type.TypeMirror;
+import javax.tools.Diagnostic;
+import javax.tools.FileObject;
+import javax.tools.StandardLocation;
+import java.io.*;
+import java.util.*;
+
+@AutoService(Processor.class)
+@SupportedSourceVersion(SourceVersion.RELEASE_21)
+@SupportedAnnotationTypes({"net.eventframework.annotation.FabricEvent", "net.eventframework.annotation.HandleEvent"})
+public class AnnotationProcessor extends AbstractProcessor {
+
+    // Collects all generated mixin class full names across all processing rounds
+    // e.g. "net.eventframework.test.mixin.ServerPlayerTickMixin"
+    private final List<String> generatedMixinClassNames = new ArrayList<>();
+
+    @Override
+    public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+        for (Element element : roundEnv.getElementsAnnotatedWith(FabricEvent.class)) {
+            if (element.getKind() != ElementKind.CLASS) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "@FabricEvent can only be applied to classes", element);
+                continue;
+            }
+            TypeElement classElement = (TypeElement) element;
+            FabricEvent fabricEvent = classElement.getAnnotation(FabricEvent.class);
+            TypeMirror targetClassMirror = getTargetClassMirror(fabricEvent);
+
+            for (Element enclosed : classElement.getEnclosedElements()) {
+                if (enclosed.getKind() != ElementKind.METHOD) continue;
+                if (enclosed.getAnnotation(HandleEvent.class) == null) continue;
+
+                ExecutableElement method = (ExecutableElement) enclosed;
+                if (!validateHandleEventMethod(method, targetClassMirror)) continue;
+                // Always generate the callback interface
+                generateCallbackInterface(classElement, method, targetClassMirror);
+
+                // Generate Mixin + Registrar and collect the mixin class name for mixin.json
+                String mixinClassName = generateMixinClass(classElement, method, targetClassMirror);
+                generateRegistrar(classElement, method, targetClassMirror);
+
+                if (mixinClassName != null) {
+                    generatedMixinClassNames.add(mixinClassName);
+                }
+            }
+        }
+
+        // On the last processing round, patch the client mod's mixin config
+        if (roundEnv.processingOver() && !generatedMixinClassNames.isEmpty()) {
+            patchMixinJson();
+        }
+
+        return true;
+    }
+
+    // Validates that when injectSelf=true, the first parameter type
+    // is assignable from the mixin target class.
+    // Emits a compile error (red underline in IDE) if the types don't match.
+    private boolean validateHandleEventMethod(
+            ExecutableElement method,
+            TypeMirror targetClassMirror
+    ) {
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+
+        if (!handleEvent.injectSelf()) return true;
+
+        List<? extends VariableElement> params = method.getParameters();
+
+        // injectSelf=true requires at least one parameter (the self type)
+        if (params.isEmpty()) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "@HandleEvent with injectSelf=true requires at least one parameter — " +
+                            "the first parameter must be the target class type: " +
+                            targetClassMirror.toString(),
+                    method
+            );
+            return false;
+        }
+
+        TypeMirror firstParamType = params.get(0).asType();
+
+        // Check that the first parameter is assignable from the target class
+        // e.g. LivingEntity param is valid for PlayerEntity target (supertype is ok)
+        // but String param for LivingEntity target is an error
+        boolean isAssignable = processingEnv.getTypeUtils()
+                .isAssignable(targetClassMirror, firstParamType);
+
+        if (!isAssignable) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "@HandleEvent injectSelf=true — first parameter must be assignable from " +
+                            "the target class '" + targetClassMirror + "'. " +
+                            "Found '" + firstParamType + "' which is not a supertype of the target.",
+                    // Underline specifically the first parameter in the IDE
+                    params.get(0)
+            );
+            return false;
+        }
+
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // MIXIN.JSON PATCHING
+    //
+    // 1. Cleans stale generated entries from the framework's own mixin config
+    // 2. Injects generated entries into the client mod's mixin config
+    // Writes ONLY to src/main/resources — Gradle copies it to the jar.
+    // ─────────────────────────────────────────────────────────────────
+    private void patchMixinJson() {
+        // Remove any previously generated entries from the framework's own mixin config
+        cleanFrameworkMixinJson();
+
+        // Find and update the client mod's mixin config
+        File mixinJsonFile = findMixinJson();
+
+        String existingContent = "";
+        if (mixinJsonFile != null && mixinJsonFile.exists()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(mixinJsonFile))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line).append("\n");
+                }
+                existingContent = sb.toString();
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "mixin config found at: " + mixinJsonFile.getAbsolutePath());
+            } catch (IOException e) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not read mixin config: " + e.getMessage());
+            }
+        } else {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "No mixin config found — will create from scratch.");
+        }
+
+        String updatedJson = existingContent.isBlank() ? buildMixinJsonFromScratch() : injectIntoExistingMixinJson(existingContent);
+
+        if (mixinJsonFile != null) {
+            writeToFileSystem(mixinJsonFile, updatedJson);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // FRAMEWORK MIXIN CONFIG CLEANUP
+    //
+    // Walks up from CLASS_OUTPUT and removes generated mixin names from
+    // any mixin config that does NOT belong to the client mod.
+    // This prevents stale entries from previous builds breaking the game.
+    // ─────────────────────────────────────────────────────────────────
+    private void cleanFrameworkMixinJson() {
+        try {
+            FileObject dummy = processingEnv.getFiler().getResource(StandardLocation.CLASS_OUTPUT, "", "dummy_probe.tmp");
+
+            File classOutputDir = new File(dummy.toUri()).getParentFile();
+            File dir = classOutputDir;
+
+            for (int i = 0; i < 10; i++) {
+                if (dir == null) break;
+
+                boolean hasGradle = new File(dir, "build.gradle").exists() || new File(dir, "build.gradle.kts").exists();
+                boolean hasMaven = new File(dir, "pom.xml").exists();
+                boolean hasSrc = new File(dir, "src").exists();
+
+                if ((hasGradle || hasMaven) && hasSrc) {
+                    // Only clean projects that do NOT own the generated mixin package
+                    if (!isMixinPackageBelongingToProject(dir)) {
+                        File resourcesDir = new File(dir, "src/main/resources");
+                        File[] jsonFiles = resourcesDir.listFiles(f -> f.getName().endsWith(".mixins.json") || f.getName().equals("mixin.json"));
+
+                        if (jsonFiles != null) {
+                            for (File jsonFile : jsonFiles) {
+                                cleanGeneratedEntriesFrom(jsonFile);
+                            }
+                        }
+                    }
+                }
+
+                dir = dir.getParentFile();
+            }
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not clean framework mixin config: " + e.getMessage());
+        }
+    }
+
+    // Removes any of our generated mixin simple names from the given mixin config file.
+    private void cleanGeneratedEntriesFrom(File jsonFile) {
+        if (!jsonFile.exists()) return;
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(jsonFile))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+            String content = sb.toString();
+            String cleaned = content;
+
+            for (String fullName : generatedMixinClassNames) {
+                String simpleName = fullName.substring(fullName.lastIndexOf('.') + 1);
+                if (!content.contains("\"" + simpleName + "\"")) continue;
+
+                // Remove the entry including its surrounding comma and whitespace
+                cleaned = cleaned.replaceAll(",\\s*\"" + simpleName + "\"", "").replaceAll("\"" + simpleName + "\"\\s*,", "").replaceAll("\"" + simpleName + "\"", "");
+
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Removed stale entry '" + simpleName + "' from " + jsonFile.getName());
+            }
+
+            if (!cleaned.equals(content)) {
+                try (Writer writer = new FileWriter(jsonFile)) {
+                    writer.write(cleaned);
+                }
+            }
+
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not clean stale entries from " + jsonFile.getName() + ": " + e.getMessage());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // LOCATING THE CLIENT MOD'S MIXIN CONFIG
+    // ─────────────────────────────────────────────────────────────────
+    private File findMixinJson() {
+        try {
+            FileObject dummy = processingEnv.getFiler().getResource(StandardLocation.CLASS_OUTPUT, "", "dummy_probe.tmp");
+
+            File classOutputDir = new File(dummy.toUri()).getParentFile();
+
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "CLASS_OUTPUT detected at: " + classOutputDir.getAbsolutePath());
+
+            File dir = classOutputDir;
+            for (int i = 0; i < 10; i++) {
+                if (dir == null) break;
+
+                boolean hasGradle = new File(dir, "build.gradle").exists() || new File(dir, "build.gradle.kts").exists();
+                boolean hasMaven = new File(dir, "pom.xml").exists();
+                boolean hasSrc = new File(dir, "src").exists();
+
+                if ((hasGradle || hasMaven) && hasSrc) {
+                    File resourcesDir = new File(dir, "src/main/resources");
+                    File fabricModJson = new File(resourcesDir, "fabric.mod.json");
+
+                    // Skip projects without fabric.mod.json
+                    if (!fabricModJson.exists()) {
+                        dir = dir.getParentFile();
+                        continue;
+                    }
+
+                    String modId = readModIdFromFabricJson(resourcesDir);
+
+                    // Verify the generated mixin package belongs to this project
+                    if (!isMixinPackageBelongingToProject(dir)) {
+                        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Skipping project '" + modId + "' — generated mixin package " + "does not belong here.");
+                        dir = dir.getParentFile();
+                        continue;
+                    }
+
+                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Detected mod id: " + modId);
+
+                    String[] candidates = {modId + ".mixins.json", modId + "-common.mixins.json", "mixin.json",};
+
+                    for (String candidate : candidates) {
+                        File f = new File(resourcesDir, candidate);
+                        if (f.exists()) {
+                            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Found existing mixin config: " + f.getName());
+                            return f;
+                        }
+                    }
+
+                    // None found — create with the standard Fabric naming convention
+                    resourcesDir.mkdirs();
+                    File newFile = new File(resourcesDir, modId + ".mixins.json");
+                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Will create new mixin config: " + newFile.getName());
+                    return newFile;
+                }
+
+                dir = dir.getParentFile();
+            }
+
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not locate project root from: " + classOutputDir.getAbsolutePath());
+            return null;
+
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not resolve CLASS_OUTPUT path: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // CLIENT SOURCES DIRECTORY
+    //
+    // Generated classes are written directly into the client mod's
+    // src/main/java so they compile into the client jar.
+    // This is required because Mixin looks up classes in the jar that
+    // declares the mixin config — which is the framework jar — but the
+    // classpath also includes the client jar, so classes written there
+    // are found correctly at runtime.
+    // ─────────────────────────────────────────────────────────────────
+    private File findClientSourcesDir() {
+        try {
+            FileObject dummy = processingEnv.getFiler().getResource(StandardLocation.CLASS_OUTPUT, "", "dummy_probe.tmp");
+
+            File classOutputDir = new File(dummy.toUri()).getParentFile();
+            File dir = classOutputDir;
+
+            for (int i = 0; i < 10; i++) {
+                if (dir == null) break;
+
+                boolean hasGradle = new File(dir, "build.gradle").exists() || new File(dir, "build.gradle.kts").exists();
+                boolean hasMaven = new File(dir, "pom.xml").exists();
+                boolean hasSrc = new File(dir, "src").exists();
+
+                if ((hasGradle || hasMaven) && hasSrc) {
+                    if (isMixinPackageBelongingToProject(dir)) {
+                        File sourcesDir = new File(dir, "src/main/java");
+                        if (sourcesDir.exists()) {
+                            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Client sources dir found: " + sourcesDir.getAbsolutePath());
+                            return sourcesDir;
+                        }
+                    }
+                }
+
+                dir = dir.getParentFile();
+            }
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not find client sources dir: " + e.getMessage());
+        }
+        return null;
+    }
+
+    // Checks whether the generated mixin package actually lives inside this
+    // project's source tree.
+    //
+    // e.g. mixin class "net.eventframework.test.mixin.ServerPlayerTickMixin"
+    //   → base package path: "net/eventframework/test"
+    //   → checks: src/main/java/net/eventframework/test/ exists in this project
+    private boolean isMixinPackageBelongingToProject(File projectRoot) {
+        if (generatedMixinClassNames.isEmpty()) return false;
+
+        String firstFull = generatedMixinClassNames.get(0);
+        String fullPackage = firstFull.substring(0, firstFull.lastIndexOf('.'));
+
+        // Go one level up from ".mixin" to get the base package
+        String basePackage = fullPackage.contains(".") ? fullPackage.substring(0, fullPackage.lastIndexOf('.')) : fullPackage;
+
+        String packagePath = basePackage.replace('.', File.separatorChar);
+        File sourceDir = new File(projectRoot, "src/main/java/" + packagePath);
+        boolean exists = sourceDir.exists() && sourceDir.isDirectory();
+
+        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Checking source dir: " + sourceDir.getAbsolutePath() + " → " + (exists ? "MATCH" : "no match"));
+
+        return exists;
+    }
+
+    // Reads the "id" field from fabric.mod.json in the resources directory.
+    // Falls back to a package-derived name if the file is missing or malformed.
+    private String readModIdFromFabricJson(File resourcesDir) {
+        File fabricModJson = new File(resourcesDir, "fabric.mod.json");
+
+        if (!fabricModJson.exists()) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "fabric.mod.json not found at: " + fabricModJson.getAbsolutePath() + " — falling back to package-derived mod id.");
+            return deriveModIdFromPackage();
+        }
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(fabricModJson))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            String json = sb.toString();
+
+            // Simple extraction of "id": "value" without a JSON library
+            int idIndex = json.indexOf("\"id\"");
+            if (idIndex == -1) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "\"id\" field not found in fabric.mod.json — falling back to package-derived mod id.");
+                return deriveModIdFromPackage();
+            }
+
+            int colonIndex = json.indexOf(':', idIndex);
+            int firstQuote = json.indexOf('"', colonIndex);
+            int secondQuote = json.indexOf('"', firstQuote + 1);
+
+            if (firstQuote == -1 || secondQuote == -1) {
+                return deriveModIdFromPackage();
+            }
+
+            String modId = json.substring(firstQuote + 1, secondQuote).trim();
+
+            return modId.isBlank() ? deriveModIdFromPackage() : modId;
+
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not read fabric.mod.json: " + e.getMessage() + " — falling back to package-derived mod id.");
+            return deriveModIdFromPackage();
+        }
+    }
+
+    // Fallback: derives a mod id from the generated mixin package name.
+    // e.g. "net.eventframework.test.mixin.ServerPlayerTickMixin" → "test"
+    private String deriveModIdFromPackage() {
+        if (!generatedMixinClassNames.isEmpty()) {
+            String[] parts = generatedMixinClassNames.get(0).split("\\.");
+            return parts.length >= 3 ? parts[2] : (parts.length >= 2 ? parts[1] : "mod");
+        }
+        return "mod";
+    }
+
+    // Writes a JavaFile directly into the client mod's src/main/java.
+    // Falls back to the standard Filer if the client sources dir is not found.
+    private void writeFileToClientSources(JavaFile javaFile) {
+        File clientSourcesDir = findClientSourcesDir();
+
+        if (clientSourcesDir != null) {
+            try {
+                javaFile.writeTo(clientSourcesDir);
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Generated file written to client sources: " + clientSourcesDir.getAbsolutePath());
+            } catch (IOException e) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "Could not write to client sources, falling back to Filer: " + e.getMessage());
+                writeFileViaFiler(javaFile);
+            }
+        } else {
+            writeFileViaFiler(javaFile);
+        }
+    }
+
+    // Standard Filer fallback for writing generated Java files
+    private void writeFileViaFiler(JavaFile javaFile) {
+        try {
+            javaFile.writeTo(processingEnv.getFiler());
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "Failed to write generated file: " + e.getMessage());
+        }
+    }
+
+    // Writes directly to the filesystem (src/main/resources/<modid>.mixins.json)
+    private void writeToFileSystem(File file, String content) {
+        try (Writer writer = new FileWriter(file)) {
+            writer.write(content);
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "mixin config written to: " + file.getAbsolutePath());
+        } catch (IOException e) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "Failed to write mixin config to filesystem: " + e.getMessage());
+        }
+    }
+
+    // Injects generated mixin simple names into the "mixins": [...] array.
+    // Preserves existing entries and indentation style of the original file.
+    private String injectIntoExistingMixinJson(String json) {
+        StringBuilder entriesToAdd = new StringBuilder();
+
+        for (String fullName : generatedMixinClassNames) {
+            String simpleName = fullName.substring(fullName.lastIndexOf('.') + 1);
+            if (!json.contains("\"" + simpleName + "\"")) {
+                entriesToAdd.append("\"").append(simpleName).append("\"");
+            }
+        }
+
+        if (entriesToAdd.isEmpty()) {
+            return json;
+        }
+
+        String entry = entriesToAdd.toString();
+
+        if (json.contains("\"mixins\": []") || json.contains("\"mixins\":[]")) {
+            // Empty array — replace with our entry
+            return json.replace("\"mixins\": []", "\"mixins\": [\n       " + entry + "\n    ]").replace("\"mixins\":[]", "\"mixins\": [\n       " + entry + "\n    ]");
+
+        } else if (json.contains("\"mixins\"")) {
+            // Non-empty array — find the last entry and append cleanly after it
+            int mixinsIndex = json.indexOf("\"mixins\"");
+            int closingBracket = json.indexOf(']', mixinsIndex);
+            int lastQuote = json.lastIndexOf('"', closingBracket);
+
+            // Detect indentation from the existing last entry line
+            int lineStart = json.lastIndexOf('\n', lastQuote);
+            String indentation = lineStart != -1 ? json.substring(lineStart + 1, json.indexOf('"', lineStart + 1)) : "       ";
+
+            return json.substring(0, lastQuote + 1) + ",\n" + indentation + entry + "\n    " + json.substring(closingBracket);
+
+        } else {
+            // No "mixins" key at all — inject before the last closing brace
+            String newArray = "\"mixins\": [\n       " + entry + "\n    ]";
+            int lastBrace = json.lastIndexOf('}');
+            return json.substring(0, lastBrace) + ",\n    " + newArray + "\n" + json.substring(lastBrace);
+        }
+    }
+
+    // Builds a minimal valid mixin config from scratch when none exists yet.
+    // The mixin package is derived from the first collected mixin class name.
+    private String buildMixinJsonFromScratch() {
+        String firstFull = generatedMixinClassNames.get(0);
+        String mixinPackage = firstFull.substring(0, firstFull.lastIndexOf('.'));
+
+        StringBuilder mixinArray = new StringBuilder();
+        for (int i = 0; i < generatedMixinClassNames.size(); i++) {
+            String full = generatedMixinClassNames.get(i);
+            String simple = full.substring(full.lastIndexOf('.') + 1);
+            if (i > 0) mixinArray.append(",\n       ");
+            mixinArray.append("\"").append(simple).append("\"");
+        }
+
+        return "{\n" + "  \"required\": true,\n" + "  \"package\": \"" + mixinPackage + "\",\n" + "  \"compatibilityLevel\": \"JAVA_21\",\n" + "  \"mixins\": [\n" + "       " + mixinArray + "\n" + "  ],\n" + "  \"injectors\": {\n" + "    \"defaultRequire\": 1\n" + "  }\n" + "}";
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 1. CALLBACK INTERFACE GENERATION
+    // ─────────────────────────────────────────────────────────────────
+    private void generateCallbackInterface(TypeElement classElement, ExecutableElement method, TypeMirror targetClassMirror) {
+        String originalPackage = processingEnv.getElementUtils().getPackageOf(classElement).getQualifiedName().toString();
+
+        String targetSimpleName = getSimpleName(targetClassMirror);
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+        boolean injectSelf = handleEvent.injectSelf();
+
+        String callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
+
+        ClassName eventClass = ClassName.get("net.fabricmc.fabric.api.event", "Event");
+        ClassName eventFactoryClass = ClassName.get("net.fabricmc.fabric.api.event", "EventFactory");
+        ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
+
+        // If injectSelf=true — include the self parameter in the callback interface.
+        // The first parameter of the annotated method is treated as the self type.
+        List<ParameterSpec> params = new ArrayList<>();
+        List<String> paramNames = new ArrayList<>();
+
+        List<VariableElement> allParams = new ArrayList<>(method.getParameters());
+
+        // When injectSelf=true the first param is the self type — include it in
+        // the callback signature so callers receive the target instance directly
+        for (VariableElement param : allParams) {
+            params.add(ParameterSpec.builder(TypeName.get(param.asType()), param.getSimpleName().toString()).build());
+            paramNames.add(param.getSimpleName().toString());
+        }
+
+        MethodSpec interfaceMethod = MethodSpec.methodBuilder("handle").addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT).returns(actionResult).addParameters(params).build();
+
+        ClassName selfClass = ClassName.get(originalPackage + ".callback", callbackName);
+        TypeName eventType = ParameterizedTypeName.get(eventClass, selfClass);
+        String argsJoined = String.join(", ", paramNames);
+
+        CodeBlock listenerLoop = CodeBlock.builder().beginControlFlow("for ($T listener : listeners)", selfClass).addStatement("$T result = listener.handle($L)", actionResult, argsJoined).beginControlFlow("if (result != $T.PASS)", actionResult).addStatement("return result").endControlFlow().endControlFlow().addStatement("return $T.PASS", actionResult).build();
+
+        CodeBlock eventInitializer = CodeBlock.builder().add("$T.createArrayBacked($T.class,\n", eventFactoryClass, selfClass).indent().add("(listeners) -> ($L) -> {\n", argsJoined).indent().add(listenerLoop).unindent().add("})").unindent().build();
+
+        FieldSpec eventField = FieldSpec.builder(eventType, "EVENT").addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.FINAL).initializer(eventInitializer).build();
+
+        TypeSpec callbackInterface = TypeSpec.interfaceBuilder(callbackName).addModifiers(Modifier.PUBLIC).addField(eventField).addMethod(interfaceMethod).build();
+
+        writeFileToClientSources(JavaFile.builder(originalPackage + ".callback", callbackInterface).indent("    ").skipJavaLangImports(true).build());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 2. MIXIN CLASS GENERATION
+    // ─────────────────────────────────────────────────────────────────
+    private String generateMixinClass(TypeElement classElement, ExecutableElement method, TypeMirror targetClassMirror) {
+        String originalPackage = processingEnv.getElementUtils().getPackageOf(classElement).getQualifiedName().toString();
+
+        String targetSimpleName = getSimpleName(targetClassMirror);
+        String methodName = method.getSimpleName().toString();
+
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+        String targetMethodName = handleEvent.nameMethod();
+        String position = handleEvent.position().getValue();
+        boolean injectSelf = handleEvent.injectSelf();
+
+        String callbackName = targetSimpleName + capitalize(targetMethodName) + "Callback";
+        String mixinClassName = targetSimpleName + capitalize(targetMethodName) + "Mixin";
+        String mixinPackage = originalPackage + ".mixin";
+        ClassName callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
+
+        AnnotationSpec atAnnotation = AnnotationSpec.builder(ClassName.get("org.spongepowered.asm.mixin.injection", "At")).addMember("value", "$S", position).build();
+
+        AnnotationSpec injectAnnotation = AnnotationSpec.builder(ClassName.get("org.spongepowered.asm.mixin.injection", "Inject")).addMember("method", "$S", targetMethodName).addMember("at", "$L", atAnnotation).addMember("cancellable", "$L", true).build();
+
+        AnnotationSpec mixinAnnotation = AnnotationSpec.builder(ClassName.get("org.spongepowered.asm.mixin", "Mixin")).addMember("value", "$T.class", targetClassMirror).build();
+
+        ClassName ciClass = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfo");
+        ClassName cirClass = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfoReturnable");
+        ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
+
+        boolean targetReturnsVoid = isTargetMethodVoid(targetClassMirror, targetMethodName, method);
+
+        TypeName callbackType = targetReturnsVoid ? ClassName.get(ciClass.packageName(), ciClass.simpleName()) : ParameterizedTypeName.get(cirClass, actionResult);
+
+        List<String> argNames = new ArrayList<>();
+        MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder("on" + capitalize(targetMethodName)).addAnnotation(injectAnnotation).addModifiers(Modifier.PRIVATE).returns(void.class);
+
+        // Add all parameters from the annotated method — skip the first one if
+        // injectSelf=true, because `this` will be injected directly in the body,
+        // not passed as a Mixin method parameter
+        List<VariableElement> params = new ArrayList<>(method.getParameters());
+        List<VariableElement> mixinParams = injectSelf ? params.subList(1, params.size()) : params;
+
+        for (VariableElement param : mixinParams) {
+            methodBuilder.addParameter(TypeName.get(param.asType()), param.getSimpleName().toString());
+            argNames.add(param.getSimpleName().toString());
+        }
+
+        // Callback info is always the last parameter, as required by Mixin
+        methodBuilder.addParameter(callbackType, "ci");
+
+        // Build the argument list for the static handler call.
+        // If injectSelf=true — prepend a cast of `this` to the declared self type
+        String argsJoined;
+        if (injectSelf && !params.isEmpty()) {
+            // The first parameter of the annotated method defines the self type
+            TypeName selfType = TypeName.get(params.get(0).asType());
+            String selfCast = "(" + selfType + ")(Object) this";
+
+            List<String> allArgs = new ArrayList<>();
+            allArgs.add(selfCast);
+            allArgs.addAll(argNames);
+            argsJoined = String.join(", ", allArgs);
+        } else {
+            argsJoined = String.join(", ", argNames);
+        }
+
+        methodBuilder.addStatement("$T result = $T.EVENT.invoker().handle($L)", actionResult, callbackClass, argsJoined).beginControlFlow("if (result == $T.FAIL)", actionResult);
+
+        if (targetReturnsVoid) {
+            // void method — cancel execution, no return value to set
+            methodBuilder.addStatement("ci.cancel()");
+        } else {
+            // non-void method — propagate the result back through Mixin
+            methodBuilder.addStatement("ci.setReturnValue(result)");
+        }
+
+        methodBuilder.endControlFlow();
+
+        TypeSpec mixinClass = TypeSpec.classBuilder(mixinClassName).addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT).addAnnotation(mixinAnnotation).addMethod(methodBuilder.build()).build();
+
+        writeFileToClientSources(JavaFile.builder(mixinPackage, mixinClass).indent("    ").skipJavaLangImports(true).build());
+
+        return mixinPackage + "." + mixinClassName;
+    }
+
+    // Checks whether the target method in the Minecraft class returns void.
+// This is used to select the correct Mixin callback type:
+//   void   → CallbackInfo
+//   other  → CallbackInfoReturnable
+//
+// Falls back to true (CallbackInfo) if the method cannot be resolved,
+// since an incorrect CIR would cause a hard crash at mixin apply time.
+    private boolean isTargetMethodVoid(TypeMirror targetClassMirror, String targetMethodName, ExecutableElement annotatedMethod) {
+        TypeElement targetClass = (TypeElement) processingEnv.getTypeUtils().asElement(targetClassMirror);
+
+        // Cannot resolve the target class — safe fallback to CallbackInfo
+        if (targetClass == null) return true;
+
+        for (Element enclosed : processingEnv.getElementUtils().getAllMembers(targetClass)) {
+            if (enclosed.getKind() != ElementKind.METHOD) continue;
+
+            ExecutableElement candidate = (ExecutableElement) enclosed;
+
+            if (!candidate.getSimpleName().toString().equals(targetMethodName)) continue;
+
+            // Match by parameter count to handle overloaded methods
+            if (candidate.getParameters().size() != annotatedMethod.getParameters().size()) continue;
+
+            return candidate.getReturnType().getKind() == TypeKind.VOID;
+        }
+
+        // Method not found in the target class — safe fallback to CallbackInfo
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 3. REGISTRAR CLASS GENERATION
+    // ─────────────────────────────────────────────────────────────────
+    private void generateRegistrar(TypeElement classElement, ExecutableElement method, TypeMirror targetClassMirror) {
+        String originalPackage = processingEnv.getElementUtils().getPackageOf(classElement).getQualifiedName().toString();
+
+        String targetSimpleName = getSimpleName(targetClassMirror);
+        String methodName = method.getSimpleName().toString();
+        String originalClassName = classElement.getSimpleName().toString();
+
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+
+        // Use the target method name for consistent naming with Callback and Mixin
+        String callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
+        ClassName callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
+        ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
+
+        List<String> argNames = new ArrayList<>();
+        for (VariableElement param : method.getParameters()) {
+            argNames.add(param.getSimpleName().toString());
+        }
+
+        String argsJoined = String.join(", ", argNames);
+
+        // Top-level add() calls never emit $[ $] markers,
+        // so addStatement() inside the lambda body is safe here
+        CodeBlock registerBlock = CodeBlock.builder().add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined).indent().addStatement("$T.$L($L)", classElement, methodName, argsJoined).addStatement("return $T.PASS", actionResult).unindent().add("});\n").build();
+
+        // addCode() — NOT addStatement() — to avoid $[ $] double-nesting crash
+        MethodSpec registerMethod = MethodSpec.methodBuilder("register").addModifiers(Modifier.PUBLIC, Modifier.STATIC).returns(void.class).addCode(registerBlock).build();
+
+        TypeSpec registrarClass = TypeSpec.classBuilder(originalClassName + "Registrar").addModifiers(Modifier.PUBLIC).addMethod(registerMethod).build();
+
+        writeFileToClientSources(JavaFile.builder(originalPackage + ".registrar", registrarClass).indent("    ").skipJavaLangImports(true).build());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────────────────────────────
+
+    // Safely extract the TypeMirror from a Class<?> annotation value.
+    // Direct access throws MirroredTypeException at compile time —
+    // catching it is the standard APT workaround.
+    private TypeMirror getTargetClassMirror(FabricEvent annotation) {
+        try {
+            annotation.value();
+        } catch (MirroredTypeException mte) {
+            return mte.getTypeMirror();
+        }
+        return null;
+    }
+
+    // Extract the simple class name from a TypeMirror
+    // e.g. "net.minecraft.server.level.ServerPlayer" → "ServerPlayer"
+    private String getSimpleName(TypeMirror mirror) {
+        String full = mirror.toString();
+        return full.substring(full.lastIndexOf('.') + 1);
+    }
+
+    // Capitalizes the first letter of a string
+    private String capitalize(String str) {
+        return str.substring(0, 1).toUpperCase() + str.substring(1);
+    }
+}
