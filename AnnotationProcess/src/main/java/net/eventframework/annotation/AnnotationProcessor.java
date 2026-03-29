@@ -7,7 +7,6 @@ import javax.annotation.processing.*;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.*;
 import javax.lang.model.type.MirroredTypeException;
-import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.tools.Diagnostic;
 import javax.tools.FileObject;
@@ -41,10 +40,9 @@ public class AnnotationProcessor extends AbstractProcessor {
 
                 ExecutableElement method = (ExecutableElement) enclosed;
                 if (!validateHandleEventMethod(method, targetClassMirror)) continue;
-                // Always generate the callback interface
+
                 generateCallbackInterface(classElement, method, targetClassMirror);
 
-                // Generate Mixin + Registrar and collect the mixin class name for mixin.json
                 String mixinClassName = generateMixinClass(classElement, method, targetClassMirror);
                 generateRegistrar(classElement, method, targetClassMirror);
 
@@ -54,7 +52,6 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
         }
 
-        // On the last processing round, patch the client mod's mixin config
         if (roundEnv.processingOver() && !generatedMixinClassNames.isEmpty()) {
             patchMixinJson();
         }
@@ -75,7 +72,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         List<? extends VariableElement> params = method.getParameters();
 
-        // injectSelf=true requires at least one parameter (the self type)
         if (params.isEmpty()) {
             processingEnv.getMessager().printMessage(
                     Diagnostic.Kind.ERROR,
@@ -89,9 +85,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         TypeMirror firstParamType = params.get(0).asType();
 
-        // Check that the first parameter is assignable from the target class
-        // e.g. LivingEntity param is valid for PlayerEntity target (supertype is ok)
-        // but String param for LivingEntity target is an error
         boolean isAssignable = processingEnv.getTypeUtils()
                 .isAssignable(targetClassMirror, firstParamType);
 
@@ -101,7 +94,6 @@ public class AnnotationProcessor extends AbstractProcessor {
                     "@HandleEvent injectSelf=true — first parameter must be assignable from " +
                             "the target class '" + targetClassMirror + "'. " +
                             "Found '" + firstParamType + "' which is not a supertype of the target.",
-                    // Underline specifically the first parameter in the IDE
                     params.get(0)
             );
             return false;
@@ -112,16 +104,10 @@ public class AnnotationProcessor extends AbstractProcessor {
 
     // ─────────────────────────────────────────────────────────────────
     // MIXIN.JSON PATCHING
-    //
-    // 1. Cleans stale generated entries from the framework's own mixin config
-    // 2. Injects generated entries into the client mod's mixin config
-    // Writes ONLY to src/main/resources — Gradle copies it to the jar.
     // ─────────────────────────────────────────────────────────────────
     private void patchMixinJson() {
-        // Remove any previously generated entries from the framework's own mixin config
         cleanFrameworkMixinJson();
 
-        // Find and update the client mod's mixin config
         File mixinJsonFile = findMixinJson();
 
         String existingContent = "";
@@ -150,10 +136,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
     // ─────────────────────────────────────────────────────────────────
     // FRAMEWORK MIXIN CONFIG CLEANUP
-    //
-    // Walks up from CLASS_OUTPUT and removes generated mixin names from
-    // any mixin config that does NOT belong to the client mod.
-    // This prevents stale entries from previous builds breaking the game.
     // ─────────────────────────────────────────────────────────────────
     private void cleanFrameworkMixinJson() {
         try {
@@ -170,7 +152,6 @@ public class AnnotationProcessor extends AbstractProcessor {
                 boolean hasSrc = new File(dir, "src").exists();
 
                 if ((hasGradle || hasMaven) && hasSrc) {
-                    // Only clean projects that do NOT own the generated mixin package
                     if (!isMixinPackageBelongingToProject(dir)) {
                         File resourcesDir = new File(dir, "src/main/resources");
                         File[] jsonFiles = resourcesDir.listFiles(f -> f.getName().endsWith(".mixins.json") || f.getName().equals("mixin.json"));
@@ -190,7 +171,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // Removes any of our generated mixin simple names from the given mixin config file.
     private void cleanGeneratedEntriesFrom(File jsonFile) {
         if (!jsonFile.exists()) return;
 
@@ -207,8 +187,10 @@ public class AnnotationProcessor extends AbstractProcessor {
                 String simpleName = fullName.substring(fullName.lastIndexOf('.') + 1);
                 if (!content.contains("\"" + simpleName + "\"")) continue;
 
-                // Remove the entry including its surrounding comma and whitespace
-                cleaned = cleaned.replaceAll(",\\s*\"" + simpleName + "\"", "").replaceAll("\"" + simpleName + "\"\\s*,", "").replaceAll("\"" + simpleName + "\"", "");
+                cleaned = cleaned
+                        .replaceAll(",\\s*\"" + simpleName + "\"", "")
+                        .replaceAll("\"" + simpleName + "\"\\s*,", "")
+                        .replaceAll("\"" + simpleName + "\"", "");
 
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Removed stale entry '" + simpleName + "' from " + jsonFile.getName());
             }
@@ -247,7 +229,6 @@ public class AnnotationProcessor extends AbstractProcessor {
                     File resourcesDir = new File(dir, "src/main/resources");
                     File fabricModJson = new File(resourcesDir, "fabric.mod.json");
 
-                    // Skip projects without fabric.mod.json
                     if (!fabricModJson.exists()) {
                         dir = dir.getParentFile();
                         continue;
@@ -255,16 +236,15 @@ public class AnnotationProcessor extends AbstractProcessor {
 
                     String modId = readModIdFromFabricJson(resourcesDir);
 
-                    // Verify the generated mixin package belongs to this project
                     if (!isMixinPackageBelongingToProject(dir)) {
-                        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Skipping project '" + modId + "' — generated mixin package " + "does not belong here.");
+                        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Skipping project '" + modId + "' — generated mixin package does not belong here.");
                         dir = dir.getParentFile();
                         continue;
                     }
 
                     processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Detected mod id: " + modId);
 
-                    String[] candidates = {modId + ".mixins.json", modId + "-common.mixins.json", "mixin.json",};
+                    String[] candidates = {modId + ".mixins.json", modId + "-common.mixins.json", "mixin.json"};
 
                     for (String candidate : candidates) {
                         File f = new File(resourcesDir, candidate);
@@ -274,7 +254,6 @@ public class AnnotationProcessor extends AbstractProcessor {
                         }
                     }
 
-                    // None found — create with the standard Fabric naming convention
                     resourcesDir.mkdirs();
                     File newFile = new File(resourcesDir, modId + ".mixins.json");
                     processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "Will create new mixin config: " + newFile.getName());
@@ -293,16 +272,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // CLIENT SOURCES DIRECTORY
-    //
-    // Generated classes are written directly into the client mod's
-    // src/main/java so they compile into the client jar.
-    // This is required because Mixin looks up classes in the jar that
-    // declares the mixin config — which is the framework jar — but the
-    // classpath also includes the client jar, so classes written there
-    // are found correctly at runtime.
-    // ─────────────────────────────────────────────────────────────────
     private File findClientSourcesDir() {
         try {
             FileObject dummy = processingEnv.getFiler().getResource(StandardLocation.CLASS_OUTPUT, "", "dummy_probe.tmp");
@@ -335,19 +304,12 @@ public class AnnotationProcessor extends AbstractProcessor {
         return null;
     }
 
-    // Checks whether the generated mixin package actually lives inside this
-    // project's source tree.
-    //
-    // e.g. mixin class "net.eventframework.test.mixin.ServerPlayerTickMixin"
-    //   → base package path: "net/eventframework/test"
-    //   → checks: src/main/java/net/eventframework/test/ exists in this project
     private boolean isMixinPackageBelongingToProject(File projectRoot) {
         if (generatedMixinClassNames.isEmpty()) return false;
 
         String firstFull = generatedMixinClassNames.get(0);
         String fullPackage = firstFull.substring(0, firstFull.lastIndexOf('.'));
 
-        // Go one level up from ".mixin" to get the base package
         String basePackage = fullPackage.contains(".") ? fullPackage.substring(0, fullPackage.lastIndexOf('.')) : fullPackage;
 
         String packagePath = basePackage.replace('.', File.separatorChar);
@@ -359,8 +321,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         return exists;
     }
 
-    // Reads the "id" field from fabric.mod.json in the resources directory.
-    // Falls back to a package-derived name if the file is missing or malformed.
     private String readModIdFromFabricJson(File resourcesDir) {
         File fabricModJson = new File(resourcesDir, "fabric.mod.json");
 
@@ -377,7 +337,6 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
             String json = sb.toString();
 
-            // Simple extraction of "id": "value" without a JSON library
             int idIndex = json.indexOf("\"id\"");
             if (idIndex == -1) {
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "\"id\" field not found in fabric.mod.json — falling back to package-derived mod id.");
@@ -402,8 +361,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // Fallback: derives a mod id from the generated mixin package name.
-    // e.g. "net.eventframework.test.mixin.ServerPlayerTickMixin" → "test"
     private String deriveModIdFromPackage() {
         if (!generatedMixinClassNames.isEmpty()) {
             String[] parts = generatedMixinClassNames.get(0).split("\\.");
@@ -412,8 +369,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         return "mod";
     }
 
-    // Writes a JavaFile directly into the client mod's src/main/java.
-    // Falls back to the standard Filer if the client sources dir is not found.
     private void writeFileToClientSources(JavaFile javaFile) {
         File clientSourcesDir = findClientSourcesDir();
 
@@ -430,7 +385,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // Standard Filer fallback for writing generated Java files
     private void writeFileViaFiler(JavaFile javaFile) {
         try {
             javaFile.writeTo(processingEnv.getFiler());
@@ -439,7 +393,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // Writes directly to the filesystem (src/main/resources/<modid>.mixins.json)
     private void writeToFileSystem(File file, String content) {
         try (Writer writer = new FileWriter(file)) {
             writer.write(content);
@@ -449,8 +402,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // Injects generated mixin simple names into the "mixins": [...] array.
-    // Preserves existing entries and indentation style of the original file.
     private String injectIntoExistingMixinJson(String json) {
         StringBuilder entriesToAdd = new StringBuilder();
 
@@ -468,31 +419,27 @@ public class AnnotationProcessor extends AbstractProcessor {
         String entry = entriesToAdd.toString();
 
         if (json.contains("\"mixins\": []") || json.contains("\"mixins\":[]")) {
-            // Empty array — replace with our entry
-            return json.replace("\"mixins\": []", "\"mixins\": [\n       " + entry + "\n    ]").replace("\"mixins\":[]", "\"mixins\": [\n       " + entry + "\n    ]");
+            return json
+                    .replace("\"mixins\": []", "\"mixins\": [\n       " + entry + "\n    ]")
+                    .replace("\"mixins\":[]", "\"mixins\": [\n       " + entry + "\n    ]");
 
         } else if (json.contains("\"mixins\"")) {
-            // Non-empty array — find the last entry and append cleanly after it
             int mixinsIndex = json.indexOf("\"mixins\"");
             int closingBracket = json.indexOf(']', mixinsIndex);
             int lastQuote = json.lastIndexOf('"', closingBracket);
 
-            // Detect indentation from the existing last entry line
             int lineStart = json.lastIndexOf('\n', lastQuote);
             String indentation = lineStart != -1 ? json.substring(lineStart + 1, json.indexOf('"', lineStart + 1)) : "       ";
 
             return json.substring(0, lastQuote + 1) + ",\n" + indentation + entry + "\n    " + json.substring(closingBracket);
 
         } else {
-            // No "mixins" key at all — inject before the last closing brace
             String newArray = "\"mixins\": [\n       " + entry + "\n    ]";
             int lastBrace = json.lastIndexOf('}');
             return json.substring(0, lastBrace) + ",\n    " + newArray + "\n" + json.substring(lastBrace);
         }
     }
 
-    // Builds a minimal valid mixin config from scratch when none exists yet.
-    // The mixin package is derived from the first collected mixin class name.
     private String buildMixinJsonFromScratch() {
         String firstFull = generatedMixinClassNames.get(0);
         String mixinPackage = firstFull.substring(0, firstFull.lastIndexOf('.'));
@@ -505,7 +452,17 @@ public class AnnotationProcessor extends AbstractProcessor {
             mixinArray.append("\"").append(simple).append("\"");
         }
 
-        return "{\n" + "  \"required\": true,\n" + "  \"package\": \"" + mixinPackage + "\",\n" + "  \"compatibilityLevel\": \"JAVA_21\",\n" + "  \"mixins\": [\n" + "       " + mixinArray + "\n" + "  ],\n" + "  \"injectors\": {\n" + "    \"defaultRequire\": 1\n" + "  }\n" + "}";
+        return "{\n" +
+                "  \"required\": true,\n" +
+                "  \"package\": \"" + mixinPackage + "\",\n" +
+                "  \"compatibilityLevel\": \"JAVA_21\",\n" +
+                "  \"mixins\": [\n" +
+                "       " + mixinArray + "\n" +
+                "  ],\n" +
+                "  \"injectors\": {\n" +
+                "    \"defaultRequire\": 1\n" +
+                "  }\n" +
+                "}";
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -516,7 +473,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         String targetSimpleName = getSimpleName(targetClassMirror);
         HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-        boolean injectSelf = handleEvent.injectSelf();
 
         String callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
 
@@ -524,35 +480,58 @@ public class AnnotationProcessor extends AbstractProcessor {
         ClassName eventFactoryClass = ClassName.get("net.fabricmc.fabric.api.event", "EventFactory");
         ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
 
-        // If injectSelf=true — include the self parameter in the callback interface.
-        // The first parameter of the annotated method is treated as the self type.
         List<ParameterSpec> params = new ArrayList<>();
         List<String> paramNames = new ArrayList<>();
 
-        List<VariableElement> allParams = new ArrayList<>(method.getParameters());
-
-        // When injectSelf=true the first param is the self type — include it in
-        // the callback signature so callers receive the target instance directly
-        for (VariableElement param : allParams) {
+        for (VariableElement param : method.getParameters()) {
             params.add(ParameterSpec.builder(TypeName.get(param.asType()), param.getSimpleName().toString()).build());
             paramNames.add(param.getSimpleName().toString());
         }
 
-        MethodSpec interfaceMethod = MethodSpec.methodBuilder("handle").addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT).returns(actionResult).addParameters(params).build();
+        MethodSpec interfaceMethod = MethodSpec.methodBuilder("handle")
+                .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
+                .returns(actionResult)
+                .addParameters(params)
+                .build();
 
         ClassName selfClass = ClassName.get(originalPackage + ".callback", callbackName);
         TypeName eventType = ParameterizedTypeName.get(eventClass, selfClass);
         String argsJoined = String.join(", ", paramNames);
 
-        CodeBlock listenerLoop = CodeBlock.builder().beginControlFlow("for ($T listener : listeners)", selfClass).addStatement("$T result = listener.handle($L)", actionResult, argsJoined).beginControlFlow("if (result != $T.PASS)", actionResult).addStatement("return result").endControlFlow().endControlFlow().addStatement("return $T.PASS", actionResult).build();
+        CodeBlock listenerLoop = CodeBlock.builder()
+                .beginControlFlow("for ($T listener : listeners)", selfClass)
+                .addStatement("$T result = listener.handle($L)", actionResult, argsJoined)
+                .beginControlFlow("if (result != $T.PASS)", actionResult)
+                .addStatement("return result")
+                .endControlFlow()
+                .endControlFlow()
+                .addStatement("return $T.PASS", actionResult)
+                .build();
 
-        CodeBlock eventInitializer = CodeBlock.builder().add("$T.createArrayBacked($T.class,\n", eventFactoryClass, selfClass).indent().add("(listeners) -> ($L) -> {\n", argsJoined).indent().add(listenerLoop).unindent().add("})").unindent().build();
+        CodeBlock eventInitializer = CodeBlock.builder()
+                .add("$T.createArrayBacked($T.class,\n", eventFactoryClass, selfClass)
+                .indent()
+                .add("(listeners) -> ($L) -> {\n", argsJoined)
+                .indent()
+                .add(listenerLoop)
+                .unindent()
+                .add("})")
+                .unindent()
+                .build();
 
-        FieldSpec eventField = FieldSpec.builder(eventType, "EVENT").addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.FINAL).initializer(eventInitializer).build();
+        FieldSpec eventField = FieldSpec.builder(eventType, "EVENT")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.FINAL)
+                .initializer(eventInitializer)
+                .build();
 
-        TypeSpec callbackInterface = TypeSpec.interfaceBuilder(callbackName).addModifiers(Modifier.PUBLIC).addField(eventField).addMethod(interfaceMethod).build();
+        TypeSpec callbackInterface = TypeSpec.interfaceBuilder(callbackName)
+                .addModifiers(Modifier.PUBLIC)
+                .addField(eventField)
+                .addMethod(interfaceMethod)
+                .build();
 
-        writeFileToClientSources(JavaFile.builder(originalPackage + ".callback", callbackInterface).indent("    ").skipJavaLangImports(true).build());
+        writeFileToClientSources(JavaFile.builder(originalPackage + ".callback", callbackInterface)
+                .indent("    ").skipJavaLangImports(true).build());
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -562,34 +541,55 @@ public class AnnotationProcessor extends AbstractProcessor {
         String originalPackage = processingEnv.getElementUtils().getPackageOf(classElement).getQualifiedName().toString();
 
         String targetSimpleName = getSimpleName(targetClassMirror);
-        String methodName = method.getSimpleName().toString();
 
         HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
         String targetMethodName = handleEvent.nameMethod();
         String position = handleEvent.position().getValue();
         boolean injectSelf = handleEvent.injectSelf();
 
+        // returnable=true means the target Minecraft method returns a non-void value.
+        // This controls whether we generate CallbackInfo or CallbackInfoReturnable.
+        // We rely on the annotation instead of APT type resolution because APT
+        // cannot reliably resolve Minecraft method return types at compile time.
+        boolean targetReturnsVoid = !handleEvent.returnable();
+
         String callbackName = targetSimpleName + capitalize(targetMethodName) + "Callback";
         String mixinClassName = targetSimpleName + capitalize(targetMethodName) + "Mixin";
         String mixinPackage = originalPackage + ".mixin";
         ClassName callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
 
-        AnnotationSpec atAnnotation = AnnotationSpec.builder(ClassName.get("org.spongepowered.asm.mixin.injection", "At")).addMember("value", "$S", position).build();
+        AnnotationSpec atAnnotation = AnnotationSpec.builder(
+                        ClassName.get("org.spongepowered.asm.mixin.injection", "At"))
+                .addMember("value", "$S", position)
+                .build();
 
-        AnnotationSpec injectAnnotation = AnnotationSpec.builder(ClassName.get("org.spongepowered.asm.mixin.injection", "Inject")).addMember("method", "$S", targetMethodName).addMember("at", "$L", atAnnotation).addMember("cancellable", "$L", true).build();
+        AnnotationSpec injectAnnotation = AnnotationSpec.builder(
+                        ClassName.get("org.spongepowered.asm.mixin.injection", "Inject"))
+                .addMember("method", "$S", targetMethodName)
+                .addMember("at", "$L", atAnnotation)
+                .addMember("cancellable", "$L", true)
+                .build();
 
-        AnnotationSpec mixinAnnotation = AnnotationSpec.builder(ClassName.get("org.spongepowered.asm.mixin", "Mixin")).addMember("value", "$T.class", targetClassMirror).build();
+        AnnotationSpec mixinAnnotation = AnnotationSpec.builder(
+                        ClassName.get("org.spongepowered.asm.mixin", "Mixin"))
+                .addMember("value", "$T.class", targetClassMirror)
+                .build();
 
         ClassName ciClass = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfo");
         ClassName cirClass = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfoReturnable");
         ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
 
-        boolean targetReturnsVoid = isTargetMethodVoid(targetClassMirror, targetMethodName, method);
-
-        TypeName callbackType = targetReturnsVoid ? ClassName.get(ciClass.packageName(), ciClass.simpleName()) : ParameterizedTypeName.get(cirClass, actionResult);
+        // Select the correct callback type based on the target method's return type
+        TypeName callbackType = targetReturnsVoid
+                ? ClassName.get(ciClass.packageName(), ciClass.simpleName())
+                : ParameterizedTypeName.get(cirClass, actionResult);
 
         List<String> argNames = new ArrayList<>();
-        MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder("on" + capitalize(targetMethodName)).addAnnotation(injectAnnotation).addModifiers(Modifier.PRIVATE).returns(void.class);
+        MethodSpec.Builder methodBuilder = MethodSpec
+                .methodBuilder("on" + capitalize(targetMethodName))
+                .addAnnotation(injectAnnotation)
+                .addModifiers(Modifier.PRIVATE)
+                .returns(void.class);
 
         // Add all parameters from the annotated method — skip the first one if
         // injectSelf=true, because `this` will be injected directly in the body,
@@ -609,7 +609,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         // If injectSelf=true — prepend a cast of `this` to the declared self type
         String argsJoined;
         if (injectSelf && !params.isEmpty()) {
-            // The first parameter of the annotated method defines the self type
             TypeName selfType = TypeName.get(params.get(0).asType());
             String selfCast = "(" + selfType + ")(Object) this";
 
@@ -621,7 +620,9 @@ public class AnnotationProcessor extends AbstractProcessor {
             argsJoined = String.join(", ", argNames);
         }
 
-        methodBuilder.addStatement("$T result = $T.EVENT.invoker().handle($L)", actionResult, callbackClass, argsJoined).beginControlFlow("if (result == $T.FAIL)", actionResult);
+        methodBuilder
+                .addStatement("$T result = $T.EVENT.invoker().handle($L)", actionResult, callbackClass, argsJoined)
+                .beginControlFlow("if (result == $T.FAIL)", actionResult);
 
         if (targetReturnsVoid) {
             // void method — cancel execution, no return value to set
@@ -633,41 +634,16 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         methodBuilder.endControlFlow();
 
-        TypeSpec mixinClass = TypeSpec.classBuilder(mixinClassName).addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT).addAnnotation(mixinAnnotation).addMethod(methodBuilder.build()).build();
+        TypeSpec mixinClass = TypeSpec.classBuilder(mixinClassName)
+                .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
+                .addAnnotation(mixinAnnotation)
+                .addMethod(methodBuilder.build())
+                .build();
 
-        writeFileToClientSources(JavaFile.builder(mixinPackage, mixinClass).indent("    ").skipJavaLangImports(true).build());
+        writeFileToClientSources(JavaFile.builder(mixinPackage, mixinClass)
+                .indent("    ").skipJavaLangImports(true).build());
 
         return mixinPackage + "." + mixinClassName;
-    }
-
-    // Checks whether the target method in the Minecraft class returns void.
-// This is used to select the correct Mixin callback type:
-//   void   → CallbackInfo
-//   other  → CallbackInfoReturnable
-//
-// Falls back to true (CallbackInfo) if the method cannot be resolved,
-// since an incorrect CIR would cause a hard crash at mixin apply time.
-    private boolean isTargetMethodVoid(TypeMirror targetClassMirror, String targetMethodName, ExecutableElement annotatedMethod) {
-        TypeElement targetClass = (TypeElement) processingEnv.getTypeUtils().asElement(targetClassMirror);
-
-        // Cannot resolve the target class — safe fallback to CallbackInfo
-        if (targetClass == null) return true;
-
-        for (Element enclosed : processingEnv.getElementUtils().getAllMembers(targetClass)) {
-            if (enclosed.getKind() != ElementKind.METHOD) continue;
-
-            ExecutableElement candidate = (ExecutableElement) enclosed;
-
-            if (!candidate.getSimpleName().toString().equals(targetMethodName)) continue;
-
-            // Match by parameter count to handle overloaded methods
-            if (candidate.getParameters().size() != annotatedMethod.getParameters().size()) continue;
-
-            return candidate.getReturnType().getKind() == TypeKind.VOID;
-        }
-
-        // Method not found in the target class — safe fallback to CallbackInfo
-        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -682,7 +658,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
 
-        // Use the target method name for consistent naming with Callback and Mixin
         String callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
         ClassName callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
         ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
@@ -696,14 +671,29 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         // Top-level add() calls never emit $[ $] markers,
         // so addStatement() inside the lambda body is safe here
-        CodeBlock registerBlock = CodeBlock.builder().add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined).indent().addStatement("$T.$L($L)", classElement, methodName, argsJoined).addStatement("return $T.PASS", actionResult).unindent().add("});\n").build();
+        CodeBlock registerBlock = CodeBlock.builder()
+                .add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined)
+                .indent()
+                .addStatement("$T.$L($L)", classElement, methodName, argsJoined)
+                .addStatement("return $T.PASS", actionResult)
+                .unindent()
+                .add("});\n")
+                .build();
 
         // addCode() — NOT addStatement() — to avoid $[ $] double-nesting crash
-        MethodSpec registerMethod = MethodSpec.methodBuilder("register").addModifiers(Modifier.PUBLIC, Modifier.STATIC).returns(void.class).addCode(registerBlock).build();
+        MethodSpec registerMethod = MethodSpec.methodBuilder("register")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .returns(void.class)
+                .addCode(registerBlock)
+                .build();
 
-        TypeSpec registrarClass = TypeSpec.classBuilder(originalClassName + "Registrar").addModifiers(Modifier.PUBLIC).addMethod(registerMethod).build();
+        TypeSpec registrarClass = TypeSpec.classBuilder(originalClassName + "Registrar")
+                .addModifiers(Modifier.PUBLIC)
+                .addMethod(registerMethod)
+                .build();
 
-        writeFileToClientSources(JavaFile.builder(originalPackage + ".registrar", registrarClass).indent("    ").skipJavaLangImports(true).build());
+        writeFileToClientSources(JavaFile.builder(originalPackage + ".registrar", registrarClass)
+                .indent("    ").skipJavaLangImports(true).build());
     }
 
     // ─────────────────────────────────────────────────────────────────

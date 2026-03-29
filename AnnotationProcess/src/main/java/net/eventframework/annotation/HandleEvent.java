@@ -18,4 +18,8 @@ public @interface HandleEvent {
     // The type to cast `this` to when injectSelf = true.
     // Defaults to Object if not specified — you'll need to cast manually.
     Class<?> selfType() default Object.class;
+
+    boolean returnable() default false;
+
+    Class<?> returnType() default Void.class;
 }
