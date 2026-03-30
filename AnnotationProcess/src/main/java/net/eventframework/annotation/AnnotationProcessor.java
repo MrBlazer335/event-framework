@@ -471,18 +471,19 @@ public class AnnotationProcessor extends AbstractProcessor {
     }
 
     private String injectIntoExistingMixinJson(String json) {
-        StringBuilder entriesToAdd = new StringBuilder();
+        List<String> toAdd = new ArrayList<>();
 
         for (String fullName : generatedMixinClassNames) {
             String simpleName = fullName.substring(fullName.lastIndexOf('.') + 1);
             if (!json.contains("\"" + simpleName + "\"")) {
-                entriesToAdd.append("\"").append(simpleName).append("\"");
+                toAdd.add("\"" + simpleName + "\"");
             }
         }
 
-        if (entriesToAdd.isEmpty()) return json;
+        if (toAdd.isEmpty()) return json;
 
-        String entry = entriesToAdd.toString();
+        // Join multiple entries with comma+newline+indentation
+        String entry = String.join(",\n       ", toAdd);
 
         if (json.contains("\"mixins\": []") || json.contains("\"mixins\":[]")) {
             return json
