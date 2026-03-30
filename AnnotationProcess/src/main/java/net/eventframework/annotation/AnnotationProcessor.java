@@ -19,27 +19,31 @@ import java.util.*;
 @SupportedAnnotationTypes({"net.eventframework.annotation.FabricEvent", "net.eventframework.annotation.HandleEvent"})
 public class AnnotationProcessor extends AbstractProcessor {
 
-    // Collects all generated mixin class full names across all processing rounds
     private final List<String> generatedMixinClassNames = new ArrayList<>();
 
     // Cached directories — resolved once on first call, reused for all events.
-    // This prevents race conditions caused by generatedMixinClassNames
-    // being populated after file generation, which caused the second event
-    // to be written to the wrong directory.
-    private File cachedClientSourcesDir = null;
-    private String cachedClassOutputPath = null;
+    // Prevents race conditions caused by generatedMixinClassNames being populated
+    // after file generation, which caused the second event to go to the wrong directory.
+    private File   cachedClientSourcesDir = null;
+    private String cachedClassOutputPath  = null;
 
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+        // Group valid methods by their declaring class so we can generate
+        // one registrar per class containing all event registrations
+        Map<TypeElement, List<ExecutableElement>> methodsByClass = new LinkedHashMap<>();
+
         for (Element element : roundEnv.getElementsAnnotatedWith(FabricEvent.class)) {
             if (element.getKind() != ElementKind.CLASS) {
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR,
                         "@FabricEvent can only be applied to classes", element);
                 continue;
             }
-            TypeElement classElement = (TypeElement) element;
-            FabricEvent fabricEvent = classElement.getAnnotation(FabricEvent.class);
-            TypeMirror targetClassMirror = getTargetClassMirror(fabricEvent);
+            TypeElement classElement    = (TypeElement) element;
+            FabricEvent fabricEvent     = classElement.getAnnotation(FabricEvent.class);
+            TypeMirror  targetClassMirror = getTargetClassMirror(fabricEvent);
+
+            List<ExecutableElement> validMethods = new ArrayList<>();
 
             for (Element enclosed : classElement.getEnclosedElements()) {
                 if (enclosed.getKind() != ElementKind.METHOD) continue;
@@ -51,12 +55,23 @@ public class AnnotationProcessor extends AbstractProcessor {
                 generateCallbackInterface(classElement, method, targetClassMirror);
 
                 String mixinClassName = generateMixinClass(classElement, method, targetClassMirror);
-                generateRegistrar(classElement, method, targetClassMirror);
-
                 if (mixinClassName != null) {
                     generatedMixinClassNames.add(mixinClassName);
                 }
+
+                validMethods.add(method);
             }
+
+            if (!validMethods.isEmpty()) {
+                methodsByClass.put(classElement, validMethods);
+            }
+        }
+
+        // Generate one registrar per class — contains all @HandleEvent methods
+        for (Map.Entry<TypeElement, List<ExecutableElement>> entry : methodsByClass.entrySet()) {
+            TypeMirror targetClassMirror = getTargetClassMirror(
+                    entry.getKey().getAnnotation(FabricEvent.class));
+            generateRegistrar(entry.getKey(), entry.getValue(), targetClassMirror);
         }
 
         if (roundEnv.processingOver() && !generatedMixinClassNames.isEmpty()) {
@@ -74,7 +89,6 @@ public class AnnotationProcessor extends AbstractProcessor {
             TypeMirror targetClassMirror
     ) {
         HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-
         if (!handleEvent.injectSelf()) return true;
 
         List<? extends VariableElement> params = method.getParameters();
@@ -91,7 +105,6 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
 
         TypeMirror firstParamType = params.get(0).asType();
-
         boolean isAssignable = processingEnv.getTypeUtils()
                 .isAssignable(targetClassMirror, firstParamType);
 
@@ -122,9 +135,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             try (BufferedReader reader = new BufferedReader(new FileReader(mixinJsonFile))) {
                 StringBuilder sb = new StringBuilder();
                 String line;
-                while ((line = reader.readLine()) != null) {
-                    sb.append(line).append("\n");
-                }
+                while ((line = reader.readLine()) != null) sb.append(line).append("\n");
                 existingContent = sb.toString();
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
                         "mixin config found at: " + mixinJsonFile.getAbsolutePath());
@@ -154,8 +165,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             String classOutputPath = getClassOutputPath();
             if (classOutputPath == null) return;
 
-            File classOutputDir = new File(classOutputPath);
-            File dir = classOutputDir;
+            File dir = new File(classOutputPath);
 
             for (int i = 0; i < 10; i++) {
                 if (dir == null) break;
@@ -166,17 +176,13 @@ public class AnnotationProcessor extends AbstractProcessor {
                 boolean hasSrc    = new File(dir, "src").exists();
 
                 if ((hasGradle || hasMaven) && hasSrc) {
-                    // Only clean projects that do NOT own this compilation
                     if (!isMixinPackageBelongingToProject(dir)) {
                         File resourcesDir = new File(dir, "src/main/resources");
-                        File[] jsonFiles = resourcesDir.listFiles(
+                        File[] jsonFiles  = resourcesDir.listFiles(
                                 f -> f.getName().endsWith(".mixins.json")
                                         || f.getName().equals("mixin.json"));
-
                         if (jsonFiles != null) {
-                            for (File jsonFile : jsonFiles) {
-                                cleanGeneratedEntriesFrom(jsonFile);
-                            }
+                            for (File jsonFile : jsonFiles) cleanGeneratedEntriesFrom(jsonFile);
                         }
                     }
                 }
@@ -195,9 +201,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         try (BufferedReader reader = new BufferedReader(new FileReader(jsonFile))) {
             StringBuilder sb = new StringBuilder();
             String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line).append("\n");
-            }
+            while ((line = reader.readLine()) != null) sb.append(line).append("\n");
             String content = sb.toString();
             String cleaned = content;
 
@@ -219,7 +223,6 @@ public class AnnotationProcessor extends AbstractProcessor {
                     writer.write(cleaned);
                 }
             }
-
         } catch (IOException e) {
             processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
                     "Could not clean stale entries from " + jsonFile.getName()
@@ -256,7 +259,6 @@ public class AnnotationProcessor extends AbstractProcessor {
                         continue;
                     }
 
-                    // Only write mixin config into the project that owns this compilation
                     if (!isMixinPackageBelongingToProject(dir)) {
                         dir = dir.getParentFile();
                         continue;
@@ -304,7 +306,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
     // ─────────────────────────────────────────────────────────────────
     // CLIENT SOURCES DIRECTORY
-    //
     // Resolved once and cached. Uses CLASS_OUTPUT path to identify the
     // correct project — no longer depends on generatedMixinClassNames.
     // ─────────────────────────────────────────────────────────────────
@@ -328,14 +329,11 @@ public class AnnotationProcessor extends AbstractProcessor {
                 if ((hasGradle || hasMaven) && hasSrc) {
                     File fabricModJson = new File(dir, "src/main/resources/fabric.mod.json");
 
-                    // Skip projects without fabric.mod.json
                     if (!fabricModJson.exists()) {
                         dir = dir.getParentFile();
                         continue;
                     }
 
-                    // The project that owns this compilation is the one whose
-                    // build directory contains CLASS_OUTPUT
                     if (isMixinPackageBelongingToProject(dir)) {
                         File sourcesDir = new File(dir, "src/main/java");
                         if (sourcesDir.exists()) {
@@ -357,28 +355,25 @@ public class AnnotationProcessor extends AbstractProcessor {
     }
 
     // Returns true if CLASS_OUTPUT is inside the given project's build directory.
-    // This replaces the old package-name-based check which depended on
+    // Replaces the old package-name-based check which depended on
     // generatedMixinClassNames being populated before file generation.
     private boolean isMixinPackageBelongingToProject(File projectRoot) {
         String classOutputPath = getClassOutputPath();
         if (classOutputPath == null) return false;
 
-        String projectPath = projectRoot.getAbsolutePath();
-
-        // Normalize separators for cross-platform safety
         String normalizedOutput  = classOutputPath.replace('\\', '/');
-        String normalizedProject = projectPath.replace('\\', '/');
+        String normalizedProject = projectRoot.getAbsolutePath().replace('\\', '/');
 
         boolean belongs = normalizedOutput.startsWith(normalizedProject);
 
         processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                "Checking project: " + projectPath + " → " + (belongs ? "MATCH" : "no match"));
+                "Checking project: " + projectRoot.getAbsolutePath()
+                        + " → " + (belongs ? "MATCH" : "no match"));
 
         return belongs;
     }
 
     // Resolves and caches the CLASS_OUTPUT path.
-    // Called by multiple methods — cached to avoid repeated Filer calls.
     private String getClassOutputPath() {
         if (cachedClassOutputPath != null) return cachedClassOutputPath;
 
@@ -409,7 +404,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             while ((line = reader.readLine()) != null) sb.append(line);
             String json = sb.toString();
 
-            int idIndex    = json.indexOf("\"id\"");
+            int idIndex = json.indexOf("\"id\"");
             if (idIndex == -1) return deriveModIdFromPackage();
 
             int colonIndex  = json.indexOf(':', idIndex);
@@ -543,14 +538,17 @@ public class AnnotationProcessor extends AbstractProcessor {
     // ─────────────────────────────────────────────────────────────────
     // 1. CALLBACK INTERFACE GENERATION
     // ─────────────────────────────────────────────────────────────────
-    private void generateCallbackInterface(TypeElement classElement, ExecutableElement method, TypeMirror targetClassMirror) {
+    private void generateCallbackInterface(
+            TypeElement classElement,
+            ExecutableElement method,
+            TypeMirror targetClassMirror
+    ) {
         String originalPackage = processingEnv.getElementUtils()
                 .getPackageOf(classElement).getQualifiedName().toString();
 
-        String targetSimpleName = getSimpleName(targetClassMirror);
-        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-
-        String callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
+        String      targetSimpleName = getSimpleName(targetClassMirror);
+        HandleEvent handleEvent      = method.getAnnotation(HandleEvent.class);
+        String      callbackName     = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
 
         ClassName eventClass        = ClassName.get("net.fabricmc.fabric.api.event", "Event");
         ClassName eventFactoryClass = ClassName.get("net.fabricmc.fabric.api.event", "EventFactory");
@@ -616,16 +614,19 @@ public class AnnotationProcessor extends AbstractProcessor {
     // ─────────────────────────────────────────────────────────────────
     // 2. MIXIN CLASS GENERATION
     // ─────────────────────────────────────────────────────────────────
-    private String generateMixinClass(TypeElement classElement, ExecutableElement method, TypeMirror targetClassMirror) {
+    private String generateMixinClass(
+            TypeElement classElement,
+            ExecutableElement method,
+            TypeMirror targetClassMirror
+    ) {
         String originalPackage = processingEnv.getElementUtils()
                 .getPackageOf(classElement).getQualifiedName().toString();
 
-        String targetSimpleName = getSimpleName(targetClassMirror);
-
-        HandleEvent handleEvent      = method.getAnnotation(HandleEvent.class);
-        String      targetMethodName = handleEvent.nameMethod();
-        String      position         = handleEvent.position().getValue();
-        boolean     injectSelf       = handleEvent.injectSelf();
+        String      targetSimpleName  = getSimpleName(targetClassMirror);
+        HandleEvent handleEvent       = method.getAnnotation(HandleEvent.class);
+        String      targetMethodName  = handleEvent.nameMethod();
+        String      position          = handleEvent.position().getValue();
+        boolean     injectSelf        = handleEvent.injectSelf();
 
         // returnable=true means the target Minecraft method returns a non-void value.
         // Determines whether CallbackInfo or CallbackInfoReturnable is generated.
@@ -718,46 +719,51 @@ public class AnnotationProcessor extends AbstractProcessor {
 
     // ─────────────────────────────────────────────────────────────────
     // 3. REGISTRAR CLASS GENERATION
+    // One registrar per @FabricEvent class — contains all @HandleEvent methods.
     // ─────────────────────────────────────────────────────────────────
-    private void generateRegistrar(TypeElement classElement, ExecutableElement method, TypeMirror targetClassMirror) {
-        String originalPackage = processingEnv.getElementUtils()
+    private void generateRegistrar(
+            TypeElement classElement,
+            List<ExecutableElement> methods,
+            TypeMirror targetClassMirror
+    ) {
+        String originalPackage   = processingEnv.getElementUtils()
                 .getPackageOf(classElement).getQualifiedName().toString();
-
         String targetSimpleName  = getSimpleName(targetClassMirror);
-        String methodName        = method.getSimpleName().toString();
         String originalClassName = classElement.getSimpleName().toString();
+        ClassName actionResult   = ClassName.get("net.minecraft.util", "ActionResult");
 
-        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-
-        String    callbackName  = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
-        ClassName callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
-        ClassName actionResult  = ClassName.get("net.minecraft.util", "ActionResult");
-
-        List<String> argNames = new ArrayList<>();
-        for (VariableElement param : method.getParameters()) {
-            argNames.add(param.getSimpleName().toString());
-        }
-
-        String argsJoined = String.join(", ", argNames);
-
-        CodeBlock registerBlock = CodeBlock.builder()
-                .add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined)
-                .indent()
-                .addStatement("$T.$L($L)", classElement, methodName, argsJoined)
-                .addStatement("return $T.PASS", actionResult)
-                .unindent()
-                .add("});\n")
-                .build();
-
-        MethodSpec registerMethod = MethodSpec.methodBuilder("register")
+        MethodSpec.Builder registerMethod = MethodSpec.methodBuilder("register")
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
-                .returns(void.class)
-                .addCode(registerBlock)
-                .build();
+                .returns(void.class);
+
+        // Generate one EVENT.register(...) block per @HandleEvent method
+        for (ExecutableElement method : methods) {
+            HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+            String      methodName  = method.getSimpleName().toString();
+            String      callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
+            ClassName   callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
+
+            List<String> argNames = new ArrayList<>();
+            for (VariableElement param : method.getParameters()) {
+                argNames.add(param.getSimpleName().toString());
+            }
+            String argsJoined = String.join(", ", argNames);
+
+            CodeBlock registerBlock = CodeBlock.builder()
+                    .add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined)
+                    .indent()
+                    .addStatement("$T.$L($L)", classElement, methodName, argsJoined)
+                    .addStatement("return $T.PASS", actionResult)
+                    .unindent()
+                    .add("});\n")
+                    .build();
+
+            registerMethod.addCode(registerBlock);
+        }
 
         TypeSpec registrarClass = TypeSpec.classBuilder(originalClassName + "Registrar")
                 .addModifiers(Modifier.PUBLIC)
-                .addMethod(registerMethod)
+                .addMethod(registerMethod.build())
                 .build();
 
         writeFileToClientSources(JavaFile.builder(originalPackage + ".registrar", registrarClass)
@@ -768,6 +774,9 @@ public class AnnotationProcessor extends AbstractProcessor {
     // HELPERS
     // ─────────────────────────────────────────────────────────────────
 
+    // Safely extract the TypeMirror from a Class<?> annotation value.
+    // Direct access throws MirroredTypeException at compile time —
+    // catching it is the standard APT workaround.
     private TypeMirror getTargetClassMirror(FabricEvent annotation) {
         try {
             annotation.value();
@@ -777,11 +786,13 @@ public class AnnotationProcessor extends AbstractProcessor {
         return null;
     }
 
+    // Extract the simple class name from a TypeMirror
     private String getSimpleName(TypeMirror mirror) {
         String full = mirror.toString();
         return full.substring(full.lastIndexOf('.') + 1);
     }
 
+    // Capitalizes the first letter of a string
     private String capitalize(String str) {
         return str.substring(0, 1).toUpperCase() + str.substring(1);
     }
