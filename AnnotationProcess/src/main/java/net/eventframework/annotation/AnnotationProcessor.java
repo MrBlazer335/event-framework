@@ -39,8 +39,8 @@ public class AnnotationProcessor extends AbstractProcessor {
                         "@FabricEvent can only be applied to classes", element);
                 continue;
             }
-            TypeElement classElement    = (TypeElement) element;
-            FabricEvent fabricEvent     = classElement.getAnnotation(FabricEvent.class);
+            TypeElement classElement      = (TypeElement) element;
+            FabricEvent fabricEvent       = classElement.getAnnotation(FabricEvent.class);
             TypeMirror  targetClassMirror = getTargetClassMirror(fabricEvent);
 
             List<ExecutableElement> validMethods = new ArrayList<>();
@@ -52,6 +52,7 @@ public class AnnotationProcessor extends AbstractProcessor {
                 ExecutableElement method = (ExecutableElement) enclosed;
                 if (!validateHandleEventMethod(method, targetClassMirror)) continue;
                 if (!validateReturnTypeIsActionResult(method)) continue;
+
                 generateCallbackInterface(classElement, method, targetClassMirror);
 
                 String mixinClassName = generateMixinClass(classElement, method, targetClassMirror);
@@ -121,10 +122,12 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         return true;
     }
+
+    // Validates that the @HandleEvent method returns ActionResult.
+    // Emits a compile error if any other return type is used.
     private boolean validateReturnTypeIsActionResult(ExecutableElement method) {
         TypeMirror returnType = method.getReturnType();
 
-        // Получаем ActionResult из classpath
         TypeElement actionResultElement = processingEnv.getElementUtils()
                 .getTypeElement("net.minecraft.util.ActionResult");
 
@@ -384,8 +387,6 @@ public class AnnotationProcessor extends AbstractProcessor {
     }
 
     // Returns true if CLASS_OUTPUT is inside the given project's build directory.
-    // Replaces the old package-name-based check which depended on
-    // generatedMixinClassNames being populated before file generation.
     private boolean isMixinPackageBelongingToProject(File projectRoot) {
         String classOutputPath = getClassOutputPath();
         if (classOutputPath == null) return false;
@@ -511,7 +512,7 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         if (toAdd.isEmpty()) return json;
 
-        // Join multiple entries with comma+newline+indentation
+        // Join multiple entries with comma + newline + indentation
         String entry = String.join(",\n       ", toAdd);
 
         if (json.contains("\"mixins\": []") || json.contains("\"mixins\":[]")) {
@@ -652,20 +653,18 @@ public class AnnotationProcessor extends AbstractProcessor {
         String originalPackage = processingEnv.getElementUtils()
                 .getPackageOf(classElement).getQualifiedName().toString();
 
-        String      targetSimpleName  = getSimpleName(targetClassMirror);
-        HandleEvent handleEvent       = method.getAnnotation(HandleEvent.class);
-        String      targetMethodName  = handleEvent.nameMethod();
-        String      position          = handleEvent.position().getValue();
-        boolean     injectSelf        = handleEvent.injectSelf();
-
-        // returnable=true means the target Minecraft method returns a non-void value.
-        // Determines whether CallbackInfo or CallbackInfoReturnable is generated.
-        boolean targetReturnsVoid = !handleEvent.returnable();
+        String      targetSimpleName = getSimpleName(targetClassMirror);
+        HandleEvent handleEvent      = method.getAnnotation(HandleEvent.class);
+        String      targetMethodName = handleEvent.nameMethod();
+        String      position         = handleEvent.position().getValue();
+        boolean     injectSelf       = handleEvent.injectSelf();
+        boolean     targetReturnsVoid = !handleEvent.returnable();
 
         String    callbackName   = targetSimpleName + capitalize(targetMethodName) + "Callback";
         String    mixinClassName = targetSimpleName + capitalize(targetMethodName) + "Mixin";
         String    mixinPackage   = originalPackage + ".mixin";
         ClassName callbackClass  = ClassName.get(originalPackage + ".callback", callbackName);
+        ClassName actionResult   = ClassName.get("net.minecraft.util", "ActionResult");
 
         AnnotationSpec atAnnotation = AnnotationSpec.builder(
                         ClassName.get("org.spongepowered.asm.mixin.injection", "At"))
@@ -684,13 +683,36 @@ public class AnnotationProcessor extends AbstractProcessor {
                 .addMember("value", "$T.class", targetClassMirror)
                 .build();
 
-        ClassName ciClass      = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfo");
-        ClassName cirClass     = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfoReturnable");
-        ClassName actionResult = ClassName.get("net.minecraft.util", "ActionResult");
+        ClassName ciClass  = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfo");
+        ClassName cirClass = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfoReturnable");
+
+        // Resolve the actual return type for CallbackInfoReturnable<T>.
+        // When returnable=true and returnType=Boolean.class → CallbackInfoReturnable<Boolean>
+        // When returnable=true and returnType=Object.class (default) → CallbackInfoReturnable<ActionResult>
+        TypeName cirReturnTypeName = actionResult; // default
+        boolean  returnIsBoolean   = false;
+
+        if (!targetReturnsVoid) {
+            try {
+                handleEvent.returnType(); // always throws MirroredTypeException at compile time
+            } catch (MirroredTypeException mte) {
+                TypeMirror returnTypeMirror = mte.getTypeMirror();
+                String     returnTypeStr    = returnTypeMirror.toString();
+
+                if (returnTypeStr.equals("java.lang.Boolean") || returnTypeStr.equals("boolean")) {
+                    cirReturnTypeName = ClassName.get("java.lang", "Boolean");
+                    returnIsBoolean   = true;
+                } else if (!returnTypeStr.equals("java.lang.Object")) {
+                    // Custom return type specified — use it directly
+                    cirReturnTypeName = TypeName.get(returnTypeMirror);
+                }
+                // java.lang.Object = default value → keep ActionResult
+            }
+        }
 
         TypeName callbackType = targetReturnsVoid
                 ? ClassName.get(ciClass.packageName(), ciClass.simpleName())
-                : ParameterizedTypeName.get(cirClass, actionResult);
+                : ParameterizedTypeName.get(cirClass, cirReturnTypeName);
 
         List<String>       argNames      = new ArrayList<>();
         MethodSpec.Builder methodBuilder = MethodSpec
@@ -707,8 +729,10 @@ public class AnnotationProcessor extends AbstractProcessor {
             argNames.add(param.getSimpleName().toString());
         }
 
+        // Callback info is always the last parameter, as required by Mixin
         methodBuilder.addParameter(callbackType, "ci");
 
+        // Build the argument list — prepend self cast if injectSelf=true
         String argsJoined;
         if (injectSelf && !params.isEmpty()) {
             TypeName selfType = TypeName.get(params.get(0).asType());
@@ -728,23 +752,14 @@ public class AnnotationProcessor extends AbstractProcessor {
                 .beginControlFlow("if (result == $T.FAIL)", actionResult);
 
         if (targetReturnsVoid) {
+            // void method — cancel execution
             methodBuilder.addStatement("ci.cancel()");
+        } else if (returnIsBoolean) {
+            // boolean method — FAIL maps to false
+            methodBuilder.addStatement("ci.setReturnValue(false)");
         } else {
-            // Check if the return type is Boolean — map ActionResult to boolean
-            try {
-                handleEvent.returnType();
-            } catch (MirroredTypeException mte) {
-                TypeMirror returnTypeMirror = mte.getTypeMirror();
-                String returnTypeStr = returnTypeMirror.toString();
-
-                if (returnTypeStr.equals("java.lang.Boolean") || returnTypeStr.equals("boolean")) {
-                    // FAIL → false, anything else → true
-                    methodBuilder.addStatement(
-                            "ci.setReturnValue(result != $T.FAIL)", actionResult);
-                } else {
-                    methodBuilder.addStatement("ci.setReturnValue(result)");
-                }
-            }
+            // other non-void — pass ActionResult directly
+            methodBuilder.addStatement("ci.setReturnValue(result)");
         }
 
         methodBuilder.endControlFlow();
@@ -780,10 +795,12 @@ public class AnnotationProcessor extends AbstractProcessor {
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
                 .returns(void.class);
 
-        // Generate one EVENT.register(...) block per @HandleEvent method
+        // Generate one EVENT.register(...) block per @HandleEvent method.
+        // Uses explicit lambda instead of method reference to avoid signature mismatch
+        // when injectSelf=true shifts the parameter count between callback and handler.
         for (ExecutableElement method : methods) {
-            HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-            String      methodName  = method.getSimpleName().toString();
+            HandleEvent handleEvent  = method.getAnnotation(HandleEvent.class);
+            String      methodName   = method.getSimpleName().toString();
             String      callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
             ClassName   callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
 
@@ -794,11 +811,11 @@ public class AnnotationProcessor extends AbstractProcessor {
             String argsJoined = String.join(", ", argNames);
 
             CodeBlock registerBlock = CodeBlock.builder()
-                    .addStatement("$T.EVENT.register($T::$L)",
-                            callbackClass,
-                            classElement,
-                            methodName
-                    )
+                    .add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined)
+                    .indent()
+                    .addStatement("return $T.$L($L)", classElement, methodName, argsJoined)
+                    .unindent()
+                    .add("});\n")
                     .build();
 
             registerMethod.addCode(registerBlock);
