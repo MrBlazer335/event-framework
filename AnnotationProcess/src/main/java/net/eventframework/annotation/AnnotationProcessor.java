@@ -730,7 +730,21 @@ public class AnnotationProcessor extends AbstractProcessor {
         if (targetReturnsVoid) {
             methodBuilder.addStatement("ci.cancel()");
         } else {
-            methodBuilder.addStatement("ci.setReturnValue(result)");
+            // Check if the return type is Boolean — map ActionResult to boolean
+            try {
+                handleEvent.returnType();
+            } catch (MirroredTypeException mte) {
+                TypeMirror returnTypeMirror = mte.getTypeMirror();
+                String returnTypeStr = returnTypeMirror.toString();
+
+                if (returnTypeStr.equals("java.lang.Boolean") || returnTypeStr.equals("boolean")) {
+                    // FAIL → false, anything else → true
+                    methodBuilder.addStatement(
+                            "ci.setReturnValue(result != $T.FAIL)", actionResult);
+                } else {
+                    methodBuilder.addStatement("ci.setReturnValue(result)");
+                }
+            }
         }
 
         methodBuilder.endControlFlow();
