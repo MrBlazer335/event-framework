@@ -51,7 +51,7 @@ public class AnnotationProcessor extends AbstractProcessor {
 
                 ExecutableElement method = (ExecutableElement) enclosed;
                 if (!validateHandleEventMethod(method, targetClassMirror)) continue;
-
+                if (!validateReturnTypeIsActionResult(method)) continue;
                 generateCallbackInterface(classElement, method, targetClassMirror);
 
                 String mixinClassName = generateMixinClass(classElement, method, targetClassMirror);
@@ -115,6 +115,35 @@ public class AnnotationProcessor extends AbstractProcessor {
                             "the target class '" + targetClassMirror + "'. " +
                             "Found '" + firstParamType + "' which is not a supertype of the target.",
                     params.get(0)
+            );
+            return false;
+        }
+
+        return true;
+    }
+    private boolean validateReturnTypeIsActionResult(ExecutableElement method) {
+        TypeMirror returnType = method.getReturnType();
+
+        // Получаем ActionResult из classpath
+        TypeElement actionResultElement = processingEnv.getElementUtils()
+                .getTypeElement("net.minecraft.util.ActionResult");
+
+        if (actionResultElement == null) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "Cannot find net.minecraft.util.ActionResult in classpath",
+                    method
+            );
+            return false;
+        }
+
+        TypeMirror expectedType = actionResultElement.asType();
+
+        if (!processingEnv.getTypeUtils().isSameType(returnType, expectedType)) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "@HandleEvent method must return ActionResult, but found: " + returnType,
+                    method
             );
             return false;
         }
@@ -753,8 +782,9 @@ public class AnnotationProcessor extends AbstractProcessor {
             CodeBlock registerBlock = CodeBlock.builder()
                     .add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined)
                     .indent()
-                    .addStatement("$T.$L($L)", classElement, methodName, argsJoined)
-                    .addStatement("return $T.PASS", actionResult)
+                    .addStatement("return $T.$L($L)", classElement, methodName, argsJoined)
+                    //removed so events could be canceled
+                    //.addStatement("return $T.PASS", actionResult)
                     .unindent()
                     .add("});\n")
                     .build();
