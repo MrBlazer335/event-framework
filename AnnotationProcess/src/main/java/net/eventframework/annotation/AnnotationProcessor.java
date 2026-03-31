@@ -781,7 +781,6 @@ public class AnnotationProcessor extends AbstractProcessor {
 
             CodeBlock registerBlock = CodeBlock.builder()
                     .add("$T.EVENT.register($T::$L)", callbackName,classElement, methodName)
-                    .add("});\n")
                     .build();
 
             registerMethod.addCode(registerBlock);
