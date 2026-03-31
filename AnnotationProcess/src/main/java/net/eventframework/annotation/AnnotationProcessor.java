@@ -780,7 +780,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             String argsJoined = String.join(", ", argNames);
 
             CodeBlock registerBlock = CodeBlock.builder()
-                    .add("$T.EVENT.register($T::$L) -> {\n", classElement, methodName)
+                    .add("$T.EVENT.register($T::$L)", callbackName,classElement, methodName)
                     .add("});\n")
                     .build();
 
