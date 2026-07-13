@@ -29,8 +29,9 @@ public class AnnotationProcessor extends AbstractProcessor {
     private String cachedClassOutputPath  = null;
 
     @Override
-    public boolean process(Set<? extends TypeElement> annotations,
-                           RoundEnvironment roundEnv) {
+    public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+        // Group valid methods by their declaring class so we can generate
+        // one registrar per class containing all event registrations
         Map<TypeElement, List<ExecutableElement>> methodsByClass = new LinkedHashMap<>();
 
         for (Element element : roundEnv.getElementsAnnotatedWith(FabricEvent.class)) {
