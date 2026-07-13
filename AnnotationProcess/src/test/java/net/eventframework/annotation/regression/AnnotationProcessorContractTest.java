@@ -19,7 +19,7 @@ import org.junit.jupiter.api.Test;
  * <p>Several tests are intentionally red against the current alpha implementation. Make the
  * processor emit the specified diagnostics and they become regression tests for the fixes.
  */
-final class AnnotationProcessorContractTest {
+final class  AnnotationProcessorContractTest {
 
     @Test
     void validPublicStaticHandlerCompiles() {
