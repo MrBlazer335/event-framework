@@ -41,7 +41,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
             TypeElement classElement      = (TypeElement) element;
             FabricEvent fabricEvent       = classElement.getAnnotation(FabricEvent.class);
-            TypeMirror  targetClassMirror = getTargetClassMirror(Objects.requireNonNull(fabricEvent));
+            TypeMirror  targetClassMirror = getTargetClassMirror(fabricEvent);
 
             List<ExecutableElement> validMethods = new ArrayList<>();
 
@@ -71,7 +71,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         // Generate one registrar per class — contains all @HandleEvent methods
         for (Map.Entry<TypeElement, List<ExecutableElement>> entry : methodsByClass.entrySet()) {
             TypeMirror targetClassMirror = getTargetClassMirror(
-                    Objects.requireNonNull(entry.getKey().getAnnotation(FabricEvent.class)));
+                    entry.getKey().getAnnotation(FabricEvent.class));
             generateRegistrar(entry.getKey(), entry.getValue(), targetClassMirror);
         }
 
@@ -90,7 +90,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             TypeMirror targetClassMirror
     ) {
         HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-        if (!Objects.requireNonNull(handleEvent).injectSelf()) return true;
+        if (!handleEvent.injectSelf()) return true;
 
         List<? extends VariableElement> params = method.getParameters();
 
@@ -105,7 +105,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             return false;
         }
 
-        TypeMirror firstParamType = params.getFirst().asType();
+        TypeMirror firstParamType = params.get(0).asType();
         boolean isAssignable = processingEnv.getTypeUtils()
                 .isAssignable(targetClassMirror, firstParamType);
 
@@ -115,7 +115,7 @@ public class AnnotationProcessor extends AbstractProcessor {
                     "@HandleEvent injectSelf=true — first parameter must be assignable from " +
                             "the target class '" + targetClassMirror + "'. " +
                             "Found '" + firstParamType + "' which is not a supertype of the target.",
-                    params.getFirst()
+                    params.get(0)
             );
             return false;
         }
@@ -455,8 +455,8 @@ public class AnnotationProcessor extends AbstractProcessor {
 
     private String deriveModIdFromPackage() {
         if (!generatedMixinClassNames.isEmpty()) {
-            String[] parts = generatedMixinClassNames.getFirst().split("\\.");
-            return parts.length >= 3 ? parts[2] : (parts.length == 2 ? parts[1] : "mod");
+            String[] parts = generatedMixinClassNames.get(0).split("\\.");
+            return parts.length >= 3 ? parts[2] : (parts.length >= 2 ? parts[1] : "mod");
         }
         return "mod";
     }
@@ -542,7 +542,7 @@ public class AnnotationProcessor extends AbstractProcessor {
     }
 
     private String buildMixinJsonFromScratch() {
-        String firstFull    = generatedMixinClassNames.getFirst();
+        String firstFull    = generatedMixinClassNames.get(0);
         String mixinPackage = firstFull.substring(0, firstFull.lastIndexOf('.'));
 
         StringBuilder mixinArray = new StringBuilder();
@@ -735,7 +735,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         // Build the argument list — prepend self cast if injectSelf=true
         String argsJoined;
         if (injectSelf && !params.isEmpty()) {
-            TypeName selfType = TypeName.get(params.getFirst().asType());
+            TypeName selfType = TypeName.get(params.get(0).asType());
             String   selfCast = "(" + selfType + ")(Object) this";
 
             List<String> allArgs = new ArrayList<>();
