@@ -3,7 +3,7 @@
 	"package": "net.eventframework.test.mixin",
 	"compatibilityLevel": "JAVA_21",
 	"mixins":[
-		"LivingEntityFallHEADMixin"
+
     ],
 	"injectors": {
 		"defaultRequire": 1
