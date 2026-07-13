@@ -1,5 +1,6 @@
 package net.eventframework;
 
+import net.eventframework.test.TestEvent;
 import net.fabricmc.api.ModInitializer;
 
 import org.slf4j.Logger;
@@ -19,7 +20,7 @@ public class EventFramework implements ModInitializer {
         // This code runs as soon as Minecraft is in a mod-load-ready state.
         // However, some things (like resources) may still be uninitialized.
         // Proceed with mild caution.
-        // TestEvent.handle();
+         TestEvent.handle();
         LOGGER.info("Hello Fabric world!");
     }
 
