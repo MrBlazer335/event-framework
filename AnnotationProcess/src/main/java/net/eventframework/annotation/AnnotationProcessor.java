@@ -181,7 +181,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         if (handlerParamsToCompare.size() != targetParams.size()) {
             processingEnv.getMessager().printMessage(
                     Diagnostic.Kind.ERROR,
-                    "@HandleEvent method parameters do not match target method '"
+                    "@HandleEvent method parameters does not match target method '"
                             + targetMethodName
                             + "'. Expected "
                             + targetParams.size()
@@ -202,7 +202,7 @@ public class AnnotationProcessor extends AbstractProcessor {
                             .isAssignable(handlerParamType, targetParamType)) {
                 processingEnv.getMessager().printMessage(
                         Diagnostic.Kind.ERROR,
-                        "@HandleEvent method parameter types do not match target method '"
+                        "@HandleEvent method parameter types does not match target method '"
                                 + targetMethodName
                                 + "'. Parameter "
                                 + (i + 1)
@@ -259,18 +259,18 @@ public class AnnotationProcessor extends AbstractProcessor {
             return false;
         }
 
-        TypeMirror expectedType = actionResultElement.asType();
+        TypeMirror actionResultType = actionResultElement.asType();
 
-        if (!processingEnv.getTypeUtils()
-                .isSameType(returnType, expectedType)) {
-            processingEnv.getMessager().printMessage(
-                    Diagnostic.Kind.ERROR,
-                    "@HandleEvent methods must return net.minecraft.util.ActionResult",
-                    method);
-            return false;
+        if (processingEnv.getTypeUtils().isSameType(returnType, actionResultType)) {
+            return true;
         }
 
-        return true;
+        // Not acceptable
+        processingEnv.getMessager().printMessage(
+                Diagnostic.Kind.ERROR,
+                "@HandleEvent methods must return net.minecraft.util.ActionResult or boolean",
+                method);
+        return false;
     }
 
     /* ----------------------------------------------------------------------- */
@@ -867,6 +867,7 @@ public class AnnotationProcessor extends AbstractProcessor {
                     .endControlFlow()
                     .build();
         } else {
+            // For non‑void handlers
             if (resultReturnType.equals(actionResult)) {
                 // ActionResult special handling – propagate PASS
                 listenerLoop = CodeBlock.builder()
@@ -944,10 +945,10 @@ public class AnnotationProcessor extends AbstractProcessor {
         String position = handleEvent.position().getValue();
         boolean injectSelf = handleEvent.injectSelf();
 
-        // Retrieve real return type of the target method
         TypeElement targetClassElement =
                 (TypeElement) processingEnv.getTypeUtils()
                         .asElement(targetClassMirror);
+
         ExecutableElement targetMethod = null;
         for (Element e : targetClassElement.getEnclosedElements()) {
             if (e.getKind() == ElementKind.METHOD &&
@@ -962,12 +963,15 @@ public class AnnotationProcessor extends AbstractProcessor {
                 targetMethod.getReturnType();
         boolean targetReturnsVoid =
                 targetReturnTypeMirror.getKind() == TypeKind.VOID;
+        boolean targetReturnsBoolean =
+                targetReturnTypeMirror.getKind() == TypeKind.BOOLEAN;
 
         String callbackName = targetSimpleName + capitalize(targetMethodName)
                 + capitalize(position) + "Callback";
         String mixinClassName = targetSimpleName + capitalize(targetMethodName)
                 + capitalize(position) + "Mixin";
         String mixinPackage = originalPackage + ".mixin";
+
         ClassName callbackClass =
                 ClassName.get(originalPackage + ".callback",
                         callbackName);
@@ -1006,38 +1010,47 @@ public class AnnotationProcessor extends AbstractProcessor {
         boolean isActionResultHandler = method.getReturnType()
                 .toString()
                 .equals("net.minecraft.util.ActionResult");
-        TypeName ciReturnBoxed = boxedType(handlerReturnTypeName);
 
-        TypeName callbackType =
+        // The <T> in CallbackInfoReturnable<T> must reflect the TARGET method's
+        // return type (boxed), not the handler's return type — the handler's
+        // ActionResult gets translated into whatever the target actually returns.
+        TypeName ciReturnBoxed =
                 targetReturnsVoid
-                        ? ClassName.get(ciClass.packageName(), ciClass.simpleName())
+                        ? null
+                        : boxedType(TypeName.get(targetReturnTypeMirror));
+
+        TypeName callbackCiType =
+                targetReturnsVoid
+                        ? ClassName.get(ciClass.packageName(),
+                        ciClass.simpleName())
                         : ParameterizedTypeName.get(cirClass, ciReturnBoxed);
 
-        List<String> argNames = new ArrayList<>();
+        List<VariableElement> params =
+                new ArrayList<>(method.getParameters());
+        List<VariableElement> mixinParams = injectSelf ? params.subList(1, params.size()) : params;
+
         MethodSpec.Builder methodBuilder = MethodSpec
                 .methodBuilder("on" + capitalize(targetMethodName))
                 .addAnnotation(injectAnnotation)
                 .addModifiers(Modifier.PRIVATE)
                 .returns(void.class);
 
-        List<VariableElement> params =
-                new ArrayList<>(method.getParameters());
-        List<VariableElement> mixinParams = injectSelf ? params.subList(1, params.size())
-                : params;
-
         for (VariableElement param : mixinParams) {
             methodBuilder.addParameter(TypeName.get(param.asType()),
                     param.getSimpleName().toString());
-            argNames.add(param.getSimpleName()
-                    .toString());
         }
 
-        methodBuilder.addParameter(callbackType,
-                "ci");
+        // add ci parameter
+        methodBuilder.addParameter(callbackCiType, "ci");
+
+        List<String> argNames = new ArrayList<>();
+        for (VariableElement param : mixinParams) {
+            argNames.add(param.getSimpleName().toString());
+        }
 
         String argsJoined;
         if (injectSelf && !params.isEmpty()) {
-            TypeName selfType = TypeName.get(params.getFirst().asType());
+            TypeName selfType = TypeName.get(params.get(0).asType());
             String selfCast =
                     "(" + selfType + ")(Object) this";
 
@@ -1052,10 +1065,15 @@ public class AnnotationProcessor extends AbstractProcessor {
         if (handlerReturnsVoid) {
             methodBuilder.addStatement("$T.EVENT.invoker().handle($L)",
                     callbackClass, argsJoined);
+            if (targetReturnsVoid && isActionResultHandler) {
+                // cancel on FAIL
+                methodBuilder.beginControlFlow("if ($T.FAIL == $T.result)", actionResultClass, callbackClass)
+                        .addStatement("ci.cancel()")
+                        .endControlFlow();
+            }
         } else {
             methodBuilder.addStatement("$T result = $T.EVENT.invoker().handle($L)",
                     handlerReturnTypeName, callbackClass, argsJoined);
-
             if (targetReturnsVoid) {
                 if (isActionResultHandler) {
                     methodBuilder.beginControlFlow("if (result == $T.FAIL)", actionResultClass)
@@ -1063,7 +1081,14 @@ public class AnnotationProcessor extends AbstractProcessor {
                             .endControlFlow();
                 }
                 // No return value to set for void target
-            } else { // target non-void
+            } else if (targetReturnsBoolean && isActionResultHandler) {
+                // Translate ActionResult -> boolean for boolean-returning targets
+                methodBuilder.beginControlFlow("if (result == $T.SUCCESS)", actionResultClass)
+                        .addStatement("ci.setReturnValue(true)")
+                        .nextControlFlow("else if (result == $T.FAIL)", actionResultClass)
+                        .addStatement("ci.setReturnValue(false)")
+                        .endControlFlow();
+            } else {
                 methodBuilder.addStatement("ci.setReturnValue(result)");
             }
         }
@@ -1170,11 +1195,12 @@ public class AnnotationProcessor extends AbstractProcessor {
 
     /* ----------------------------------------------------------------------- */
     private String capitalize(String str) {
+        if (str == null || str.isEmpty()) return str;
         return str.substring(0, 1).toUpperCase() + str.substring(1);
     }
 
     /* ----------------------------------------------------------------------- */
-    // Helper that returns the default literal for a given type
+    /** Returns the default literal for a given type. */
     private String defaultLiteralFor(TypeName type) {
         if (type.equals(TypeName.BOOLEAN)) return "false";
         if (type.equals(TypeName.INT)) return "0";
@@ -1188,17 +1214,24 @@ public class AnnotationProcessor extends AbstractProcessor {
         return "null";
     }
 
-    /* ----------------------------------------------------------------------- */
-    // Helper that returns the boxed type for primitives
+    /** Returns the boxed type for primitives. */
     private TypeName boxedType(TypeName type) {
-        if (type.equals(TypeName.BOOLEAN)) return ClassName.get("java.lang", "Boolean");
-        if (type.equals(TypeName.INT)) return ClassName.get("java.lang", "Integer");
-        if (type.equals(TypeName.LONG)) return ClassName.get("java.lang", "Long");
-        if (type.equals(TypeName.FLOAT)) return ClassName.get("java.lang", "Float");
-        if (type.equals(TypeName.DOUBLE)) return ClassName.get("java.lang", "Double");
-        if (type.equals(TypeName.BYTE)) return ClassName.get("java.lang", "Byte");
-        if (type.equals(TypeName.SHORT)) return ClassName.get("java.lang", "Short");
-        if (type.equals(TypeName.CHAR)) return ClassName.get("java.lang", "Character");
+        if (type.equals(TypeName.BOOLEAN))
+            return ClassName.get("java.lang", "Boolean");
+        if (type.equals(TypeName.INT))
+            return ClassName.get("java.lang", "Integer");
+        if (type.equals(TypeName.LONG))
+            return ClassName.get("java.lang", "Long");
+        if (type.equals(TypeName.FLOAT))
+            return ClassName.get("java.lang", "Float");
+        if (type.equals(TypeName.DOUBLE))
+            return ClassName.get("java.lang", "Double");
+        if (type.equals(TypeName.BYTE))
+            return ClassName.get("java.lang", "Byte");
+        if (type.equals(TypeName.SHORT))
+            return ClassName.get("java.lang", "Short");
+        if (type.equals(TypeName.CHAR))
+            return ClassName.get("java.lang", "Character");
         // For other types, keep as is
         return type;
     }
