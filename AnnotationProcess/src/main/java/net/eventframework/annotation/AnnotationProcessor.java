@@ -8,6 +8,7 @@ import javax.lang.model.SourceVersion;
 import javax.lang.model.element.*;
 import javax.lang.model.type.MirroredTypeException;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.type.TypeKind;
 import javax.tools.Diagnostic;
 import javax.tools.FileObject;
 import javax.tools.StandardLocation;
@@ -16,14 +17,14 @@ import java.util.*;
 
 @AutoService(Processor.class)
 @SupportedSourceVersion(SourceVersion.RELEASE_21)
-@SupportedAnnotationTypes({"net.eventframework.annotation.FabricEvent", "net.eventframework.annotation.HandleEvent"})
+@SupportedAnnotationTypes({
+        "net.eventframework.annotation.FabricEvent",
+        "net.eventframework.annotation.HandleEvent"
+})
 public class AnnotationProcessor extends AbstractProcessor {
 
     private final List<String> generatedMixinClassNames = new ArrayList<>();
 
-    // Cached directories — resolved once on first call, reused for all events.
-    // Prevents race conditions caused by generatedMixinClassNames being populated
-    // after file generation, which caused the second event to go to the wrong directory.
     private File   cachedClientSourcesDir = null;
     private String cachedClassOutputPath  = null;
 
@@ -41,7 +42,7 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
             TypeElement classElement      = (TypeElement) element;
             FabricEvent fabricEvent       = classElement.getAnnotation(FabricEvent.class);
-            TypeMirror  targetClassMirror = getTargetClassMirror(fabricEvent);
+            TypeMirror  targetClassMirror = getTargetClassMirror(Objects.requireNonNull(fabricEvent));
 
             List<ExecutableElement> validMethods = new ArrayList<>();
 
@@ -55,7 +56,8 @@ public class AnnotationProcessor extends AbstractProcessor {
 
                 generateCallbackInterface(classElement, method, targetClassMirror);
 
-                String mixinClassName = generateMixinClass(classElement, method, targetClassMirror);
+                String mixinClassName =
+                        generateMixinClass(classElement, method, targetClassMirror);
                 if (mixinClassName != null) {
                     generatedMixinClassNames.add(mixinClassName);
                 }
@@ -68,95 +70,211 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
         }
 
-        // Generate one registrar per class — contains all @HandleEvent methods
-        for (Map.Entry<TypeElement, List<ExecutableElement>> entry : methodsByClass.entrySet()) {
+        for (Map.Entry<TypeElement,
+                List<ExecutableElement>> entry : methodsByClass.entrySet()) {
             TypeMirror targetClassMirror = getTargetClassMirror(
-                    entry.getKey().getAnnotation(FabricEvent.class));
+                    Objects.requireNonNull(entry.getKey().getAnnotation(FabricEvent.class)));
             generateRegistrar(entry.getKey(), entry.getValue(), targetClassMirror);
         }
 
         if (roundEnv.processingOver() && !generatedMixinClassNames.isEmpty()) {
             patchMixinJson();
         }
-
         return true;
     }
 
-    // Validates that when injectSelf=true, the first parameter type
-    // is assignable from the mixin target class.
-    // Emits a compile error (red underline in IDE) if the types don't match.
-    private boolean validateHandleEventMethod(
-            ExecutableElement method,
-            TypeMirror targetClassMirror
-    ) {
-        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
-        if (!handleEvent.injectSelf()) return true;
+    /* ----------------------------------------------------------------------- */
+    private boolean validateHandleEventMethod(ExecutableElement method,
+                                              TypeMirror     targetClassMirror) {
+        Set<Modifier> modifiers = method.getModifiers();
 
-        List<? extends VariableElement> params = method.getParameters();
+        if (!modifiers.contains(Modifier.STATIC)) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR, "@HandleEvent methods must be static", method);
+            return false;
+        }
 
-        if (params.isEmpty()) {
+        if (!modifiers.contains(Modifier.PUBLIC)) {
             processingEnv.getMessager().printMessage(
                     Diagnostic.Kind.ERROR,
-                    "@HandleEvent with injectSelf=true requires at least one parameter — " +
-                            "the first parameter must be the target class type: " +
-                            targetClassMirror.toString(),
+                    "@HandleEvent methods must be public",
                     method
             );
             return false;
         }
 
-        TypeMirror firstParamType = params.get(0).asType();
-        boolean isAssignable = processingEnv.getTypeUtils()
-                .isAssignable(targetClassMirror, firstParamType);
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+        if (handleEvent == null) return false;
 
-        if (!isAssignable) {
+        String targetMethodName =
+                handleEvent.nameMethod();
+        TypeElement targetClassElement =
+                (TypeElement) processingEnv.getTypeUtils()
+                        .asElement(targetClassMirror);
+
+        if (targetClassElement == null) {
             processingEnv.getMessager().printMessage(
                     Diagnostic.Kind.ERROR,
-                    "@HandleEvent injectSelf=true — first parameter must be assignable from " +
-                            "the target class '" + targetClassMirror + "'. " +
-                            "Found '" + firstParamType + "' which is not a supertype of the target.",
-                    params.get(0)
+                    "Cannot find target class: " + targetClassMirror,
+                    method
             );
             return false;
+        }
+
+        List<ExecutableElement> targetMethods = new ArrayList<>();
+        for (Element enclosed : targetClassElement.getEnclosedElements()) {
+            if (enclosed.getKind() == ElementKind.METHOD &&
+                    enclosed.getSimpleName().toString()
+                            .equals(targetMethodName)) {
+                targetMethods.add((ExecutableElement) enclosed);
+            }
+        }
+
+        if (targetMethods.isEmpty()) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "Target method '"
+                            + targetMethodName
+                            + "' was not found in "
+                            + targetClassMirror,
+                    method
+            );
+            return false;
+        }
+
+        if (targetMethods.size() > 1) {
+            processingEnv.getMessager()
+                    .printMessage(
+                            Diagnostic.Kind.ERROR,
+                            "Target method '"
+                                    + targetMethodName
+                                    + "' is overloaded. "
+                                    + "Use method descriptor to specify which overload to use.",
+                            method
+                    );
+            return false;
+        }
+
+        ExecutableElement targetMethod = targetMethods.getFirst();
+        List<? extends VariableElement> handlerParams = method.getParameters();
+        List<? extends VariableElement> targetParams  = targetMethod.getParameters();
+
+        boolean injectSelf = handleEvent.injectSelf();
+
+        /* ---- special error for injectSelf without params -------------------------------- */
+        if (injectSelf && handlerParams.isEmpty()) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "@HandleEvent with injectSelf=true requires at least one parameter — "
+                            + "the first parameter must be the target class type: "
+                            + targetClassMirror.toString(),
+                    method
+            );
+            return false;
+        }
+
+        List<? extends VariableElement>
+                handlerParamsToCompare =
+                injectSelf && !handlerParams.isEmpty()
+                        ? handlerParams.subList(1, handlerParams.size())
+                        : handlerParams;
+
+        if (handlerParamsToCompare.size() != targetParams.size()) {
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "@HandleEvent method parameters does not match target method '"
+                            + targetMethodName
+                            + "'. Expected "
+                            + targetParams.size()
+                            + " parameters, but found "
+                            + handlerParamsToCompare.size(),
+                    method);
+            return false;
+        }
+
+        for (int i = 0; i < targetParams.size(); i++) {
+            TypeMirror targetParamType = targetParams.get(i).asType();
+            TypeMirror handlerParamType =
+                    handlerParamsToCompare.get(i).asType();
+
+            if (!processingEnv.getTypeUtils().isAssignable(targetParamType,
+                    handlerParamType) &&
+                    !processingEnv.getTypeUtils()
+                            .isAssignable(handlerParamType, targetParamType)) {
+                processingEnv.getMessager().printMessage(
+                        Diagnostic.Kind.ERROR,
+                        "@HandleEvent method parameter types does not match target method '"
+                                + targetMethodName
+                                + "'. Parameter "
+                                + (i + 1)
+                                + " expected "
+                                + targetParamType
+                                + " but found "
+                                + handlerParamType,
+                        method);
+                return false;
+            }
+        }
+
+        if (handleEvent.injectSelf()) {
+            TypeMirror firstParamType = handlerParams.getFirst().asType();
+            boolean isAssignable =
+                    processingEnv.getTypeUtils()
+                            .isAssignable(targetClassMirror, firstParamType);
+
+            if (!isAssignable) {
+                processingEnv.getMessager().printMessage(
+                        Diagnostic.Kind.ERROR,
+                        "@HandleEvent injectSelf=true — first parameter must be compatible with "
+                                + "the target class '"
+                                + targetClassMirror
+                                + "'. Found '"
+                                + firstParamType
+                                + "' which is not a supertype of the target.",
+                        handlerParams.getFirst());
+                return false;
+            }
         }
 
         return true;
     }
 
-    // Validates that the @HandleEvent method returns ActionResult.
-    // Emits a compile error if any other return type is used.
+    /* ----------------------------------------------------------------------- */
     private boolean validateReturnTypeIsActionResult(ExecutableElement method) {
         TypeMirror returnType = method.getReturnType();
 
-        TypeElement actionResultElement = processingEnv.getElementUtils()
-                .getTypeElement("net.minecraft.util.ActionResult");
+        if (returnType.getKind() == TypeKind.VOID) {
+            // void handlers are allowed
+            return true;
+        }
+
+        TypeElement actionResultElement =
+                processingEnv.getElementUtils()
+                        .getTypeElement("net.minecraft.util.ActionResult");
 
         if (actionResultElement == null) {
             processingEnv.getMessager().printMessage(
                     Diagnostic.Kind.ERROR,
                     "Cannot find net.minecraft.util.ActionResult in classpath",
-                    method
-            );
+                    method);
             return false;
         }
 
-        TypeMirror expectedType = actionResultElement.asType();
+        TypeMirror actionResultType = actionResultElement.asType();
 
-        if (!processingEnv.getTypeUtils().isSameType(returnType, expectedType)) {
-            processingEnv.getMessager().printMessage(
-                    Diagnostic.Kind.ERROR,
-                    "@HandleEvent method must return ActionResult, but found: " + returnType,
-                    method
-            );
-            return false;
+        if (processingEnv.getTypeUtils().isSameType(returnType, actionResultType)) {
+            return true;
         }
 
-        return true;
+        // Not acceptable
+        processingEnv.getMessager().printMessage(
+                Diagnostic.Kind.ERROR,
+                "@HandleEvent methods must return net.minecraft.util.ActionResult or boolean",
+                method);
+        return false;
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // MIXIN.JSON PATCHING
-    // ─────────────────────────────────────────────────────────────────
+    /* ----------------------------------------------------------------------- */
     private void patchMixinJson() {
         cleanFrameworkMixinJson();
 
@@ -164,20 +282,23 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         String existingContent = "";
         if (mixinJsonFile != null && mixinJsonFile.exists()) {
-            try (BufferedReader reader = new BufferedReader(new FileReader(mixinJsonFile))) {
+            try (BufferedReader reader = new BufferedReader(
+                    new FileReader(mixinJsonFile))) {
                 StringBuilder sb = new StringBuilder();
                 String line;
                 while ((line = reader.readLine()) != null) sb.append(line).append("\n");
                 existingContent = sb.toString();
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                        "mixin config found at: " + mixinJsonFile.getAbsolutePath());
+                processingEnv.getMessager()
+                        .printMessage(Diagnostic.Kind.NOTE,
+                                "mixin config found at: " + mixinJsonFile.getAbsolutePath());
             } catch (IOException e) {
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                        "Could not read mixin config: " + e.getMessage());
+                processingEnv.getMessager().printMessage(
+                        Diagnostic.Kind.WARNING, "Could not read mixin config: " + e.getMessage());
             }
         } else {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                    "No mixin config found — will create from scratch.");
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.NOTE,
+                            "No mixin config found — will create from scratch.");
         }
 
         String updatedJson = existingContent.isBlank()
@@ -189,9 +310,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // FRAMEWORK MIXIN CONFIG CLEANUP
-    // ─────────────────────────────────────────────────────────────────
+    /* ----------------------------------------------------------------------- */
     private void cleanFrameworkMixinJson() {
         try {
             String classOutputPath = getClassOutputPath();
@@ -202,19 +321,26 @@ public class AnnotationProcessor extends AbstractProcessor {
             for (int i = 0; i < 10; i++) {
                 if (dir == null) break;
 
-                boolean hasGradle = new File(dir, "build.gradle").exists()
-                        || new File(dir, "build.gradle.kts").exists();
+                boolean hasGradle =
+                        new File(dir, "build.gradle").exists()
+                                || new File(dir,
+                                "build.gradle.kts")
+                                .exists();
                 boolean hasMaven  = new File(dir, "pom.xml").exists();
                 boolean hasSrc    = new File(dir, "src").exists();
 
                 if ((hasGradle || hasMaven) && hasSrc) {
                     if (!isMixinPackageBelongingToProject(dir)) {
-                        File resourcesDir = new File(dir, "src/main/resources");
-                        File[] jsonFiles  = resourcesDir.listFiles(
-                                f -> f.getName().endsWith(".mixins.json")
-                                        || f.getName().equals("mixin.json"));
+                        File resourcesDir =
+                                new File(dir, "src/main/resources");
+                        File[] jsonFiles =
+                                resourcesDir.listFiles(
+                                        f -> f.getName()
+                                                .endsWith(".mixins.json")
+                                                || f.getName().equals("mixin.json"));
                         if (jsonFiles != null) {
-                            for (File jsonFile : jsonFiles) cleanGeneratedEntriesFrom(jsonFile);
+                            for (File jsonFile : jsonFiles)
+                                cleanGeneratedEntriesFrom(jsonFile);
                         }
                     }
                 }
@@ -222,32 +348,45 @@ public class AnnotationProcessor extends AbstractProcessor {
                 dir = dir.getParentFile();
             }
         } catch (Exception e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not clean framework mixin config: " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.WARNING,
+                            "Could not clean framework mixin config: "
+                                    + e.getMessage());
         }
     }
 
+    /* ----------------------------------------------------------------------- */
     private void cleanGeneratedEntriesFrom(File jsonFile) {
         if (!jsonFile.exists()) return;
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(jsonFile))) {
+        try (BufferedReader reader = new BufferedReader(
+                new FileReader(jsonFile))) {
             StringBuilder sb = new StringBuilder();
             String line;
-            while ((line = reader.readLine()) != null) sb.append(line).append("\n");
+            while ((line = reader.readLine()) != null)
+                sb.append(line).append("\n");
             String content = sb.toString();
             String cleaned = content;
 
             for (String fullName : generatedMixinClassNames) {
-                String simpleName = fullName.substring(fullName.lastIndexOf('.') + 1);
+                String simpleName =
+                        fullName.substring(fullName.lastIndexOf('.') + 1);
                 if (!content.contains("\"" + simpleName + "\"")) continue;
 
-                cleaned = cleaned
-                        .replaceAll(",\\s*\"" + simpleName + "\"", "")
-                        .replaceAll("\"" + simpleName + "\"\\s*,", "")
-                        .replaceAll("\"" + simpleName + "\"", "");
+                cleaned =
+                        cleaned
+                                .replaceAll(
+                                        ",\\s*\"" + simpleName + "\"", "")
+                                .replaceAll("\"" + simpleName + "\",",
+                                        "")
+                                .replaceAll("\"" + simpleName + "\"",
+                                        "");
 
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                        "Removed stale entry '" + simpleName + "' from " + jsonFile.getName());
+                processingEnv.getMessager().printMessage(
+                        Diagnostic.Kind.NOTE,
+                        "Removed stale entry '" + simpleName
+                                + "' from "
+                                + jsonFile.getName());
             }
 
             if (!cleaned.equals(content)) {
@@ -256,69 +395,91 @@ public class AnnotationProcessor extends AbstractProcessor {
                 }
             }
         } catch (IOException e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not clean stale entries from " + jsonFile.getName()
-                            + ": " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(
+                            Diagnostic.Kind.WARNING,
+                            "Could not clean stale entries from "
+                                    + jsonFile.getName()
+                                    + ": "
+                                    + e.getMessage());
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // LOCATING THE CLIENT MOD'S MIXIN CONFIG
-    // ─────────────────────────────────────────────────────────────────
+    /* ----------------------------------------------------------------------- */
     private File findMixinJson() {
         try {
             String classOutputPath = getClassOutputPath();
             if (classOutputPath == null) return null;
 
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                    "CLASS_OUTPUT detected at: " + classOutputPath);
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.NOTE, "CLASS_OUTPUT detected at: "
+                            + classOutputPath);
 
             File dir = new File(classOutputPath);
             for (int i = 0; i < 10; i++) {
                 if (dir == null) break;
 
-                boolean hasGradle = new File(dir, "build.gradle").exists()
-                        || new File(dir, "build.gradle.kts").exists();
+                boolean hasGradle =
+                        new File(dir, "build.gradle").exists()
+                                || new File(dir,
+                                "build.gradle.kts")
+                                .exists();
                 boolean hasMaven  = new File(dir, "pom.xml").exists();
                 boolean hasSrc    = new File(dir, "src").exists();
 
                 if ((hasGradle || hasMaven) && hasSrc) {
-                    File resourcesDir  = new File(dir, "src/main/resources");
-                    File fabricModJson = new File(resourcesDir, "fabric.mod.json");
+                    File resourcesDir =
+                            new File(dir, "src/main/resources");
+                    File fabricModJson =
+                            new File(resourcesDir,
+                                    "fabric.mod.json");
 
                     if (!fabricModJson.exists()) {
                         dir = dir.getParentFile();
                         continue;
                     }
 
-                    if (!isMixinPackageBelongingToProject(dir)) {
+                    if (!isMixinPackageBelongingToProject(
+                            dir)) {
                         dir = dir.getParentFile();
                         continue;
                     }
 
-                    String modId = readModIdFromFabricJson(resourcesDir);
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                            "Detected mod id: " + modId);
+                    String modId =
+                            readModIdFromFabricJson(resourcesDir);
+                    processingEnv.getMessager()
+                            .printMessage(Diagnostic.Kind.NOTE,
+                                    "Detected mod id: "
+                                            + modId);
 
-                    String[] candidates = {
-                            modId + ".mixins.json",
-                            modId + "-common.mixins.json",
-                            "mixin.json"
-                    };
+                    String[] candidates = {modId
+                            + ".mixins.json",
+                            modId
+                                    + "-common.mixins.json",
+                            "mixin.json"};
 
                     for (String candidate : candidates) {
-                        File f = new File(resourcesDir, candidate);
+                        File f =
+                                new File(resourcesDir, candidate);
                         if (f.exists()) {
-                            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                                    "Found existing mixin config: " + f.getName());
+                            processingEnv.getMessager()
+                                    .printMessage(
+                                            Diagnostic.Kind.NOTE,
+                                            "Found existing mixin config: "
+                                                    + f.getName());
                             return f;
                         }
                     }
 
                     resourcesDir.mkdirs();
-                    File newFile = new File(resourcesDir, modId + ".mixins.json");
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                            "Will create new mixin config: " + newFile.getName());
+                    File newFile =
+                            new File(resourcesDir, modId
+                                    + ".mixins.json");
+                    processingEnv.getMessager()
+                            .printMessage(
+                                    Diagnostic.Kind.NOTE,
+                                    "Will create new mixin config: "
+                                            + newFile.getName());
                     return newFile;
                 }
 
@@ -326,21 +487,21 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
 
             processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not locate project root from: " + classOutputPath);
+                    "Could not locate project root from: "
+                            + classOutputPath);
             return null;
 
         } catch (Exception e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not resolve CLASS_OUTPUT path: " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(
+                            Diagnostic.Kind.WARNING,
+                            "Could not resolve CLASS_OUTPUT path: "
+                                    + e.getMessage());
             return null;
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // CLIENT SOURCES DIRECTORY
-    // Resolved once and cached. Uses CLASS_OUTPUT path to identify the
-    // correct project — no longer depends on generatedMixinClassNames.
-    // ─────────────────────────────────────────────────────────────────
+    /* ----------------------------------------------------------------------- */
     private File findClientSourcesDir() {
         if (cachedClientSourcesDir != null) return cachedClientSourcesDir;
 
@@ -353,24 +514,33 @@ public class AnnotationProcessor extends AbstractProcessor {
             for (int i = 0; i < 10; i++) {
                 if (dir == null) break;
 
-                boolean hasGradle = new File(dir, "build.gradle").exists()
-                        || new File(dir, "build.gradle.kts").exists();
+                boolean hasGradle =
+                        new File(dir, "build.gradle").exists()
+                                || new File(dir,
+                                "build.gradle.kts")
+                                .exists();
                 boolean hasMaven  = new File(dir, "pom.xml").exists();
                 boolean hasSrc    = new File(dir, "src").exists();
 
                 if ((hasGradle || hasMaven) && hasSrc) {
-                    File fabricModJson = new File(dir, "src/main/resources/fabric.mod.json");
+                    File fabricModJson =
+                            new File(dir,
+                                    "src/main/resources/fabric.mod.json");
 
                     if (!fabricModJson.exists()) {
                         dir = dir.getParentFile();
                         continue;
                     }
 
-                    if (isMixinPackageBelongingToProject(dir)) {
-                        File sourcesDir = new File(dir, "src/main/java");
+                    if (isMixinPackageBelongingToProject(
+                            dir)) {
+                        File sourcesDir =
+                                new File(dir, "src/main/java");
                         if (sourcesDir.exists()) {
-                            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                                    "Client sources dir found: " + sourcesDir.getAbsolutePath());
+                            processingEnv.getMessager()
+                                    .printMessage(Diagnostic.Kind.NOTE,
+                                            "Client sources dir found: "
+                                                    + sourcesDir.getAbsolutePath());
                             cachedClientSourcesDir = sourcesDir;
                             return cachedClientSourcesDir;
                         }
@@ -380,55 +550,72 @@ public class AnnotationProcessor extends AbstractProcessor {
                 dir = dir.getParentFile();
             }
         } catch (Exception e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not find client sources dir: " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.WARNING,
+                            "Could not find client sources dir: "
+                                    + e.getMessage());
         }
         return null;
     }
 
-    // Returns true if CLASS_OUTPUT is inside the given project's build directory.
+    /* ----------------------------------------------------------------------- */
     private boolean isMixinPackageBelongingToProject(File projectRoot) {
         String classOutputPath = getClassOutputPath();
         if (classOutputPath == null) return false;
 
-        String normalizedOutput  = classOutputPath.replace('\\', '/');
-        String normalizedProject = projectRoot.getAbsolutePath().replace('\\', '/');
+        String normalizedOutput =
+                classOutputPath.replace('\\', '/');
+        String normalizedProject =
+                projectRoot.getAbsolutePath().replace('\\', '/');
 
-        boolean belongs = normalizedOutput.startsWith(normalizedProject);
+        boolean belongs =
+                normalizedOutput.startsWith(normalizedProject);
 
-        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                "Checking project: " + projectRoot.getAbsolutePath()
-                        + " → " + (belongs ? "MATCH" : "no match"));
+        processingEnv.getMessager()
+                .printMessage(Diagnostic.Kind.NOTE,
+                        "Checking project: "
+                                + projectRoot.getAbsolutePath()
+                                + " -> "
+                                + (belongs ? "MATCH" : "no match"));
 
         return belongs;
     }
 
-    // Resolves and caches the CLASS_OUTPUT path.
+    /* ----------------------------------------------------------------------- */
     private String getClassOutputPath() {
         if (cachedClassOutputPath != null) return cachedClassOutputPath;
 
         try {
             FileObject dummy = processingEnv.getFiler()
-                    .getResource(StandardLocation.CLASS_OUTPUT, "", "dummy_probe.tmp");
-            cachedClassOutputPath = new File(dummy.toUri()).getParentFile().getAbsolutePath();
+                    .getResource(StandardLocation.CLASS_OUTPUT,
+                            "", "dummy_probe.tmp");
+            cachedClassOutputPath =
+                    new File(dummy.toUri()).getParentFile().getAbsolutePath();
         } catch (IOException e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not resolve CLASS_OUTPUT: " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(
+                            Diagnostic.Kind.WARNING,
+                            "Could not resolve CLASS_OUTPUT: "
+                                    + e.getMessage());
         }
 
         return cachedClassOutputPath;
     }
 
+    /* ----------------------------------------------------------------------- */
     private String readModIdFromFabricJson(File resourcesDir) {
-        File fabricModJson = new File(resourcesDir, "fabric.mod.json");
+        File fabricModJson =
+                new File(resourcesDir, "fabric.mod.json");
 
         if (!fabricModJson.exists()) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "fabric.mod.json not found — falling back to package-derived mod id.");
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.WARNING,
+                            "fabric.mod.json not found — falling back to package-derived mod id.");
             return deriveModIdFromPackage();
         }
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(fabricModJson))) {
+        try (BufferedReader reader = new BufferedReader(
+                new FileReader(fabricModJson))) {
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = reader.readLine()) != null) sb.append(line);
@@ -437,40 +624,57 @@ public class AnnotationProcessor extends AbstractProcessor {
             int idIndex = json.indexOf("\"id\"");
             if (idIndex == -1) return deriveModIdFromPackage();
 
-            int colonIndex  = json.indexOf(':', idIndex);
-            int firstQuote  = json.indexOf('"', colonIndex);
-            int secondQuote = json.indexOf('"', firstQuote + 1);
+            int colonIndex =
+                    json.indexOf(':', idIndex);
+            int firstQuote =
+                    json.indexOf('"', colonIndex);
+            int secondQuote =
+                    json.indexOf('"',
+                            firstQuote + 1);
 
             if (firstQuote == -1 || secondQuote == -1) return deriveModIdFromPackage();
 
             String modId = json.substring(firstQuote + 1, secondQuote).trim();
-            return modId.isBlank() ? deriveModIdFromPackage() : modId;
+            return modId.isBlank()
+                    ? deriveModIdFromPackage()
+                    : modId;
 
         } catch (IOException e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not read fabric.mod.json: " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(
+                            Diagnostic.Kind.WARNING,
+                            "Could not read fabric.mod.json: "
+                                    + e.getMessage());
             return deriveModIdFromPackage();
         }
     }
 
+    /* ----------------------------------------------------------------------- */
     private String deriveModIdFromPackage() {
         if (!generatedMixinClassNames.isEmpty()) {
-            String[] parts = generatedMixinClassNames.get(0).split("\\.");
-            return parts.length >= 3 ? parts[2] : (parts.length >= 2 ? parts[1] : "mod");
+            String[] parts =
+                    generatedMixinClassNames.getFirst().split("\\.");
+            return parts.length >= 3
+                    ? parts[2]
+                    : (parts.length == 2 ? parts[1] : "mod");
         }
         return "mod";
     }
 
+    /* ----------------------------------------------------------------------- */
     private void writeFileToClientSources(JavaFile javaFile) {
         File clientSourcesDir = findClientSourcesDir();
 
         if (clientSourcesDir != null) {
             try {
                 javaFile.writeTo(clientSourcesDir);
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                        "Generated file written to: " + clientSourcesDir.getAbsolutePath());
+                processingEnv.getMessager()
+                        .printMessage(Diagnostic.Kind.NOTE,
+                                "Generated file written to: "
+                                        + clientSourcesDir.getAbsolutePath());
             } catch (IOException e) {
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
+                processingEnv.getMessager().printMessage(
+                        Diagnostic.Kind.WARNING,
                         "Could not write to client sources, falling back to Filer: "
                                 + e.getMessage());
                 writeFileViaFiler(javaFile);
@@ -480,31 +684,41 @@ public class AnnotationProcessor extends AbstractProcessor {
         }
     }
 
+    /* ----------------------------------------------------------------------- */
     private void writeFileViaFiler(JavaFile javaFile) {
         try {
             javaFile.writeTo(processingEnv.getFiler());
         } catch (IOException e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR,
-                    "Failed to write generated file: " + e.getMessage());
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "Failed to write generated file: "
+                                    + e.getMessage());
         }
     }
 
+    /* ----------------------------------------------------------------------- */
     private void writeToFileSystem(File file, String content) {
         try (Writer writer = new FileWriter(file)) {
             writer.write(content);
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
-                    "mixin config written to: " + file.getAbsolutePath());
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.NOTE,
+                            "mixin config written to: "
+                                    + file.getAbsolutePath());
         } catch (IOException e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR,
-                    "Failed to write mixin config: " + e.getMessage());
+            processingEnv.getMessager().printMessage(
+                    Diagnostic.Kind.ERROR,
+                    "Failed to write mixin config: "
+                            + e.getMessage());
         }
     }
 
+    /* ----------------------------------------------------------------------- */
     private String injectIntoExistingMixinJson(String json) {
         List<String> toAdd = new ArrayList<>();
 
         for (String fullName : generatedMixinClassNames) {
-            String simpleName = fullName.substring(fullName.lastIndexOf('.') + 1);
+            String simpleName =
+                    fullName.substring(fullName.lastIndexOf('.') + 1);
             if (!json.contains("\"" + simpleName + "\"")) {
                 toAdd.add("\"" + simpleName + "\"");
             }
@@ -512,231 +726,334 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         if (toAdd.isEmpty()) return json;
 
-        // Join multiple entries with comma + newline + indentation
         String entry = String.join(",\n       ", toAdd);
 
         if (json.contains("\"mixins\": []") || json.contains("\"mixins\":[]")) {
             return json
-                    .replace("\"mixins\": []", "\"mixins\": [\n       " + entry + "\n    ]")
-                    .replace("\"mixins\":[]",   "\"mixins\": [\n       " + entry + "\n    ]");
-
+                    .replace(
+                            "\"mixins\": []",
+                            "\"mixins\": [\n       "
+                                    + entry
+                                    + "\n    ]")
+                    .replace(
+                            "\"mixins\":[]",
+                            "\"mixins\": [\n       "
+                                    + entry
+                                    + "\n    ]");
         } else if (json.contains("\"mixins\"")) {
-            int mixinsIndex    = json.indexOf("\"mixins\"");
-            int closingBracket = json.indexOf(']', mixinsIndex);
-            int lastQuote      = json.lastIndexOf('"', closingBracket);
+            int mixinsIndex = json.indexOf("\"mixins\"");
+            int closingBracket =
+                    json.indexOf(']', mixinsIndex);
+            int lastQuote =
+                    json.lastIndexOf('"', closingBracket);
 
-            int lineStart = json.lastIndexOf('\n', lastQuote);
-            String indentation = lineStart != -1
-                    ? json.substring(lineStart + 1, json.indexOf('"', lineStart + 1))
-                    : "       ";
+            int lineStart = json.lastIndexOf('\n',
+                    lastQuote);
+            String indentation =
+                    lineStart != -1
+                            ? json.substring(lineStart + 1,
+                            json.indexOf('"', lineStart + 1))
+                            : "       ";
 
             return json.substring(0, lastQuote + 1)
-                    + ",\n" + indentation + entry + "\n    "
+                    + ",\n"
+                    + indentation
+                    + entry
+                    + "\n    "
                     + json.substring(closingBracket);
         } else {
-            String newArray = "\"mixins\": [\n       " + entry + "\n    ]";
-            int lastBrace = json.lastIndexOf('}');
-            return json.substring(0, lastBrace) + ",\n    " + newArray + "\n"
+            String newArray = "\"mixins\": [\n       "
+                    + entry
+                    + "\n    ]";
+            int lastBrace =
+                    json.lastIndexOf('}');
+            return json.substring(0, lastBrace)
+                    + ",\n    "
+                    + newArray
+                    + "\n"
                     + json.substring(lastBrace);
         }
     }
 
+    /* ----------------------------------------------------------------------- */
     private String buildMixinJsonFromScratch() {
-        String firstFull    = generatedMixinClassNames.get(0);
-        String mixinPackage = firstFull.substring(0, firstFull.lastIndexOf('.'));
+        String firstFull = generatedMixinClassNames.getFirst();
+        String mixinPackage =
+                firstFull.substring(0,
+                        firstFull.lastIndexOf('.'));
 
         StringBuilder mixinArray = new StringBuilder();
         for (int i = 0; i < generatedMixinClassNames.size(); i++) {
             String full   = generatedMixinClassNames.get(i);
             String simple = full.substring(full.lastIndexOf('.') + 1);
             if (i > 0) mixinArray.append(",\n       ");
-            mixinArray.append("\"").append(simple).append("\"");
+            mixinArray.append("\"")
+                    .append(simple)
+                    .append("\"");
         }
 
-        return "{\n" +
-                "  \"required\": true,\n" +
-                "  \"package\": \"" + mixinPackage + "\",\n" +
-                "  \"compatibilityLevel\": \"JAVA_21\",\n" +
-                "  \"mixins\": [\n" +
-                "       " + mixinArray + "\n" +
-                "  ],\n" +
-                "  \"injectors\": {\n" +
-                "    \"defaultRequire\": 1\n" +
-                "  }\n" +
-                "}";
+        return "{\n"
+                + "  \"required\": true,\n"
+                + "  \"package\": \"" + mixinPackage
+                + "\",\n"
+                + "  \"compatibilityLevel\": \"JAVA_21\",\n"
+                + "  \"mixins\": [\n"
+                + "       "
+                + mixinArray
+                + "\n  ],\n"
+                + "  \"injectors\": {\n"
+                + "    \"defaultRequire\": 1\n"
+                + "  }\n"
+                + "}";
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // 1. CALLBACK INTERFACE GENERATION
-    // ─────────────────────────────────────────────────────────────────
-    private void generateCallbackInterface(
-            TypeElement classElement,
-            ExecutableElement method,
-            TypeMirror targetClassMirror
-    ) {
-        String originalPackage = processingEnv.getElementUtils()
-                .getPackageOf(classElement).getQualifiedName().toString();
+    /* ----------------------------------------------------------------------- */
+    /** Generates the callback interface used by the event system. */
+    private void generateCallbackInterface(TypeElement classElement,
+                                           ExecutableElement method,
+                                           TypeMirror targetClassMirror) {
+        String originalPackage =
+                processingEnv.getElementUtils()
+                        .getPackageOf(classElement).getQualifiedName().toString();
 
-        String      targetSimpleName = getSimpleName(targetClassMirror);
-        HandleEvent handleEvent      = method.getAnnotation(HandleEvent.class);
-        String      callbackName     = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
+        String targetSimpleName = getSimpleName(targetClassMirror);
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+        String callbackName = targetSimpleName + capitalize(handleEvent.nameMethod())
+                + capitalize(handleEvent.position().getValue()) + "Callback";
 
-        ClassName eventClass        = ClassName.get("net.fabricmc.fabric.api.event", "Event");
-        ClassName eventFactoryClass = ClassName.get("net.fabricmc.fabric.api.event", "EventFactory");
-        ClassName actionResult      = ClassName.get("net.minecraft.util", "ActionResult");
+        ClassName eventClass = ClassName.get("net.fabricmc.fabric.api.event", "Event");
+        ClassName eventFactoryClass =
+                ClassName.get("net.fabricmc.fabric.api.event", "EventFactory");
 
-        List<ParameterSpec> params     = new ArrayList<>();
-        List<String>        paramNames = new ArrayList<>();
+        boolean returnsVoid = method.getReturnType().getKind() == TypeKind.VOID;
+        ClassName actionResult = null;
+        if (!returnsVoid) {
+            actionResult = ClassName.get("net.minecraft.util", "ActionResult");
+        }
+
+        List<ParameterSpec> params = new ArrayList<>();
+        List<String> paramNames = new ArrayList<>();
 
         for (VariableElement param : method.getParameters()) {
-            params.add(ParameterSpec.builder(
-                    TypeName.get(param.asType()),
-                    param.getSimpleName().toString()
-            ).build());
+            params.add(ParameterSpec.builder(TypeName.get(param.asType()),
+                    param.getSimpleName().toString()).build());
             paramNames.add(param.getSimpleName().toString());
         }
 
-        MethodSpec interfaceMethod = MethodSpec.methodBuilder("handle")
+        TypeName resultReturnType;
+        if (returnsVoid) {
+            resultReturnType = TypeName.VOID;
+        } else {
+            resultReturnType = TypeName.get(method.getReturnType());
+        }
+
+        MethodSpec.Builder ifaceBuilder = MethodSpec.methodBuilder("handle")
                 .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
-                .returns(actionResult)
-                .addParameters(params)
-                .build();
+                .addParameters(params);
 
-        ClassName selfClass  = ClassName.get(originalPackage + ".callback", callbackName);
-        TypeName  eventType  = ParameterizedTypeName.get(eventClass, selfClass);
-        String    argsJoined = String.join(", ", paramNames);
+        ifaceBuilder.returns(resultReturnType);
 
-        CodeBlock listenerLoop = CodeBlock.builder()
-                .beginControlFlow("for ($T listener : listeners)", selfClass)
-                .addStatement("$T result = listener.handle($L)", actionResult, argsJoined)
-                .beginControlFlow("if (result != $T.PASS)", actionResult)
-                .addStatement("return result")
-                .endControlFlow()
-                .endControlFlow()
-                .addStatement("return $T.PASS", actionResult)
-                .build();
+        MethodSpec interfaceMethod = ifaceBuilder.build();
 
-        CodeBlock eventInitializer = CodeBlock.builder()
-                .add("$T.createArrayBacked($T.class,\n", eventFactoryClass, selfClass)
+        ClassName selfClass = ClassName.get(originalPackage + ".callback", callbackName);
+        TypeName eventType =
+                ParameterizedTypeName.get(eventClass, selfClass);
+        String argsJoined = String.join(", ", paramNames);
+
+        CodeBlock listenerLoop;
+        if (returnsVoid) {
+            listenerLoop = CodeBlock.builder()
+                    .beginControlFlow("for ($T listener : listeners)", selfClass)
+                    .addStatement("listener.handle($L)", argsJoined)
+                    .endControlFlow()
+                    .build();
+        } else {
+            // For non‑void handlers
+            if (resultReturnType.equals(actionResult)) {
+                // ActionResult special handling – propagate PASS
+                listenerLoop = CodeBlock.builder()
+                        .beginControlFlow("for ($T listener : listeners)", selfClass)
+                        .addStatement("$T result = listener.handle($L)",
+                                actionResult, argsJoined)
+                        .beginControlFlow("if (result != $T.PASS)", actionResult)
+                        .addStatement("return result")
+                        .endControlFlow()
+                        .endControlFlow()
+                        .addStatement("return $T.PASS", actionResult)
+                        .build();
+            } else {
+                // Generic handler – return the last listener’s result
+                CodeBlock.Builder loopBuilder = CodeBlock.builder()
+                        .addStatement("$T result = $L",
+                                resultReturnType, defaultLiteralFor(resultReturnType));
+                loopBuilder.beginControlFlow("for ($T listener : listeners)", selfClass);
+                loopBuilder.addStatement("result = listener.handle($L)", argsJoined);
+                loopBuilder.endControlFlow()
+                        .addStatement("return result");
+                listenerLoop = loopBuilder.build();
+            }
+        }
+
+        CodeBlock.Builder initializer = CodeBlock.builder()
+                .add("$T.createArrayBacked($T.class,\n",
+                        eventFactoryClass,
+                        selfClass)
                 .indent()
                 .add("(listeners) -> ($L) -> {\n", argsJoined)
                 .indent()
-                .add(listenerLoop)
+                .add(listenerLoop);
+
+        /* No unconditional return added here – listenerLoop already returns PASS if needed */
+        initializer
                 .unindent()
                 .add("})")
-                .unindent()
-                .build();
+                .unindent();
+
+        CodeBlock eventInitializer = initializer.build();
 
         FieldSpec eventField = FieldSpec.builder(eventType, "EVENT")
-                .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.FINAL)
+                .addModifiers(Modifier.PUBLIC,
+                        Modifier.STATIC, Modifier.FINAL)
                 .initializer(eventInitializer)
                 .build();
 
-        TypeSpec callbackInterface = TypeSpec.interfaceBuilder(callbackName)
-                .addModifiers(Modifier.PUBLIC)
-                .addField(eventField)
-                .addMethod(interfaceMethod)
-                .build();
+        TypeSpec callbackInterface =
+                TypeSpec.interfaceBuilder(callbackName)
+                        .addModifiers(Modifier.PUBLIC)
+                        .addField(eventField)
+                        .addMethod(interfaceMethod)
+                        .build();
 
-        writeFileToClientSources(JavaFile.builder(originalPackage + ".callback", callbackInterface)
-                .indent("    ").skipJavaLangImports(true).build());
+        writeFileToClientSources(
+                JavaFile.builder(originalPackage + ".callback",
+                                callbackInterface)
+                        .indent("    ")
+                        .skipJavaLangImports(true).build());
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // 2. MIXIN CLASS GENERATION
-    // ─────────────────────────────────────────────────────────────────
-    private String generateMixinClass(
-            TypeElement classElement,
-            ExecutableElement method,
-            TypeMirror targetClassMirror
-    ) {
-        String originalPackage = processingEnv.getElementUtils()
-                .getPackageOf(classElement).getQualifiedName().toString();
+    /* ----------------------------------------------------------------------- */
+    /** Generates the mixin class that injects into the target method. */
+    private String generateMixinClass(TypeElement classElement,
+                                      ExecutableElement method,
+                                      TypeMirror targetClassMirror) {
+        String originalPackage =
+                processingEnv.getElementUtils()
+                        .getPackageOf(classElement).getQualifiedName().toString();
 
-        String      targetSimpleName = getSimpleName(targetClassMirror);
-        HandleEvent handleEvent      = method.getAnnotation(HandleEvent.class);
-        String      targetMethodName = handleEvent.nameMethod();
-        String      position         = handleEvent.position().getValue();
-        boolean     injectSelf       = handleEvent.injectSelf();
-        boolean     targetReturnsVoid = !handleEvent.returnable();
+        String targetSimpleName = getSimpleName(targetClassMirror);
+        HandleEvent handleEvent = method.getAnnotation(HandleEvent.class);
+        String targetMethodName = handleEvent.nameMethod();
+        String position = handleEvent.position().getValue();
+        boolean injectSelf = handleEvent.injectSelf();
 
-        String    callbackName   = targetSimpleName + capitalize(targetMethodName) + "Callback";
-        String    mixinClassName = targetSimpleName + capitalize(targetMethodName) + "Mixin";
-        String    mixinPackage   = originalPackage + ".mixin";
-        ClassName callbackClass  = ClassName.get(originalPackage + ".callback", callbackName);
-        ClassName actionResult   = ClassName.get("net.minecraft.util", "ActionResult");
+        TypeElement targetClassElement =
+                (TypeElement) processingEnv.getTypeUtils()
+                        .asElement(targetClassMirror);
+
+        ExecutableElement targetMethod = null;
+        for (Element e : targetClassElement.getEnclosedElements()) {
+            if (e.getKind() == ElementKind.METHOD &&
+                    e.getSimpleName().contentEquals(targetMethodName)) {
+                targetMethod = (ExecutableElement) e;
+                break;
+            }
+        }
+        if (targetMethod == null) return null; // already validated
+
+        TypeMirror targetReturnTypeMirror =
+                targetMethod.getReturnType();
+        boolean targetReturnsVoid =
+                targetReturnTypeMirror.getKind() == TypeKind.VOID;
+        boolean targetReturnsBoolean =
+                targetReturnTypeMirror.getKind() == TypeKind.BOOLEAN;
+
+        String callbackName = targetSimpleName + capitalize(targetMethodName)
+                + capitalize(position) + "Callback";
+        String mixinClassName = targetSimpleName + capitalize(targetMethodName)
+                + capitalize(position) + "Mixin";
+        String mixinPackage = originalPackage + ".mixin";
+
+        ClassName callbackClass =
+                ClassName.get(originalPackage + ".callback",
+                        callbackName);
+        ClassName actionResultClass =
+                ClassName.get("net.minecraft.util", "ActionResult");
 
         AnnotationSpec atAnnotation = AnnotationSpec.builder(
-                        ClassName.get("org.spongepowered.asm.mixin.injection", "At"))
+                        ClassName.get("org.spongepowered.asm.mixin.injection",
+                                "At"))
                 .addMember("value", "$S", position)
                 .build();
 
         AnnotationSpec injectAnnotation = AnnotationSpec.builder(
-                        ClassName.get("org.spongepowered.asm.mixin.injection", "Inject"))
+                        ClassName.get("org.spongepowered.asm.mixin.injection",
+                                "Inject"))
                 .addMember("method", "$S", targetMethodName)
                 .addMember("at", "$L", atAnnotation)
                 .addMember("cancellable", "$L", true)
                 .build();
 
         AnnotationSpec mixinAnnotation = AnnotationSpec.builder(
-                        ClassName.get("org.spongepowered.asm.mixin", "Mixin"))
+                        ClassName.get("org.spongepowered.asm.mixin",
+                                "Mixin"))
                 .addMember("value", "$T.class", targetClassMirror)
                 .build();
 
-        ClassName ciClass  = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfo");
-        ClassName cirClass = ClassName.get("org.spongepowered.asm.mixin.injection.callback", "CallbackInfoReturnable");
+        ClassName ciClass =
+                ClassName.get("org.spongepowered.asm.mixin.injection.callback",
+                        "CallbackInfo");
+        ClassName cirClass =
+                ClassName.get("org.spongepowered.asm.mixin.injection.callback",
+                        "CallbackInfoReturnable");
 
-        // Resolve the actual return type for CallbackInfoReturnable<T>.
-        // When returnable=true and returnType=Boolean.class → CallbackInfoReturnable<Boolean>
-        // When returnable=true and returnType=Object.class (default) → CallbackInfoReturnable<ActionResult>
-        TypeName cirReturnTypeName = actionResult; // default
-        boolean  returnIsBoolean   = false;
+        boolean handlerReturnsVoid = method.getReturnType().getKind() == TypeKind.VOID;
+        TypeName handlerReturnTypeName = TypeName.get(method.getReturnType());
+        boolean isActionResultHandler = method.getReturnType()
+                .toString()
+                .equals("net.minecraft.util.ActionResult");
 
-        if (!targetReturnsVoid) {
-            try {
-                handleEvent.returnType(); // always throws MirroredTypeException at compile time
-            } catch (MirroredTypeException mte) {
-                TypeMirror returnTypeMirror = mte.getTypeMirror();
-                String     returnTypeStr    = returnTypeMirror.toString();
+        // The <T> in CallbackInfoReturnable<T> must reflect the TARGET method's
+        // return type (boxed), not the handler's return type — the handler's
+        // ActionResult gets translated into whatever the target actually returns.
+        TypeName ciReturnBoxed =
+                targetReturnsVoid
+                        ? null
+                        : boxedType(TypeName.get(targetReturnTypeMirror));
 
-                if (returnTypeStr.equals("java.lang.Boolean") || returnTypeStr.equals("boolean")) {
-                    cirReturnTypeName = ClassName.get("java.lang", "Boolean");
-                    returnIsBoolean   = true;
-                } else if (!returnTypeStr.equals("java.lang.Object")) {
-                    // Custom return type specified — use it directly
-                    cirReturnTypeName = TypeName.get(returnTypeMirror);
-                }
-                // java.lang.Object = default value → keep ActionResult
-            }
-        }
+        TypeName callbackCiType =
+                targetReturnsVoid
+                        ? ClassName.get(ciClass.packageName(),
+                        ciClass.simpleName())
+                        : ParameterizedTypeName.get(cirClass, ciReturnBoxed);
 
-        TypeName callbackType = targetReturnsVoid
-                ? ClassName.get(ciClass.packageName(), ciClass.simpleName())
-                : ParameterizedTypeName.get(cirClass, cirReturnTypeName);
+        List<VariableElement> params =
+                new ArrayList<>(method.getParameters());
+        List<VariableElement> mixinParams = injectSelf ? params.subList(1, params.size()) : params;
 
-        List<String>       argNames      = new ArrayList<>();
         MethodSpec.Builder methodBuilder = MethodSpec
                 .methodBuilder("on" + capitalize(targetMethodName))
                 .addAnnotation(injectAnnotation)
                 .addModifiers(Modifier.PRIVATE)
                 .returns(void.class);
 
-        List<VariableElement> params      = new ArrayList<>(method.getParameters());
-        List<VariableElement> mixinParams = injectSelf ? params.subList(1, params.size()) : params;
-
         for (VariableElement param : mixinParams) {
-            methodBuilder.addParameter(TypeName.get(param.asType()), param.getSimpleName().toString());
+            methodBuilder.addParameter(TypeName.get(param.asType()),
+                    param.getSimpleName().toString());
+        }
+
+        // add ci parameter
+        methodBuilder.addParameter(callbackCiType, "ci");
+
+        List<String> argNames = new ArrayList<>();
+        for (VariableElement param : mixinParams) {
             argNames.add(param.getSimpleName().toString());
         }
 
-        // Callback info is always the last parameter, as required by Mixin
-        methodBuilder.addParameter(callbackType, "ci");
-
-        // Build the argument list — prepend self cast if injectSelf=true
         String argsJoined;
         if (injectSelf && !params.isEmpty()) {
             TypeName selfType = TypeName.get(params.get(0).asType());
-            String   selfCast = "(" + selfType + ")(Object) this";
+            String selfCast =
+                    "(" + selfType + ")(Object) this";
 
             List<String> allArgs = new ArrayList<>();
             allArgs.add(selfCast);
@@ -746,23 +1063,36 @@ public class AnnotationProcessor extends AbstractProcessor {
             argsJoined = String.join(", ", argNames);
         }
 
-        methodBuilder
-                .addStatement("$T result = $T.EVENT.invoker().handle($L)",
-                        actionResult, callbackClass, argsJoined)
-                .beginControlFlow("if (result == $T.FAIL)", actionResult);
-
-        if (targetReturnsVoid) {
-            // void method — cancel execution
-            methodBuilder.addStatement("ci.cancel()");
-        } else if (returnIsBoolean) {
-            // boolean method — FAIL maps to false
-            methodBuilder.addStatement("ci.setReturnValue(false)");
+        if (handlerReturnsVoid) {
+            methodBuilder.addStatement("$T.EVENT.invoker().handle($L)",
+                    callbackClass, argsJoined);
+            if (targetReturnsVoid && isActionResultHandler) {
+                // cancel on FAIL
+                methodBuilder.beginControlFlow("if ($T.FAIL == $T.result)", actionResultClass, callbackClass)
+                        .addStatement("ci.cancel()")
+                        .endControlFlow();
+            }
         } else {
-            // other non-void — pass ActionResult directly
-            methodBuilder.addStatement("ci.setReturnValue(result)");
+            methodBuilder.addStatement("$T result = $T.EVENT.invoker().handle($L)",
+                    handlerReturnTypeName, callbackClass, argsJoined);
+            if (targetReturnsVoid) {
+                if (isActionResultHandler) {
+                    methodBuilder.beginControlFlow("if (result == $T.FAIL)", actionResultClass)
+                            .addStatement("ci.cancel()")
+                            .endControlFlow();
+                }
+                // No return value to set for void target
+            } else if (targetReturnsBoolean && isActionResultHandler) {
+                // Translate ActionResult -> boolean for boolean-returning targets
+                methodBuilder.beginControlFlow("if (result == $T.SUCCESS)", actionResultClass)
+                        .addStatement("ci.setReturnValue(true)")
+                        .nextControlFlow("else if (result == $T.FAIL)", actionResultClass)
+                        .addStatement("ci.setReturnValue(false)")
+                        .endControlFlow();
+            } else {
+                methodBuilder.addStatement("ci.setReturnValue(result)");
+            }
         }
-
-        methodBuilder.endControlFlow();
 
         TypeSpec mixinClass = TypeSpec.classBuilder(mixinClassName)
                 .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
@@ -770,38 +1100,36 @@ public class AnnotationProcessor extends AbstractProcessor {
                 .addMethod(methodBuilder.build())
                 .build();
 
-        writeFileToClientSources(JavaFile.builder(mixinPackage, mixinClass)
-                .indent("    ").skipJavaLangImports(true).build());
+        writeFileToClientSources(
+                JavaFile.builder(mixinPackage,
+                                mixinClass)
+                        .indent("    ")
+                        .skipJavaLangImports(true).build());
 
         return mixinPackage + "." + mixinClassName;
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // 3. REGISTRAR CLASS GENERATION
-    // One registrar per @FabricEvent class — contains all @HandleEvent methods.
-    // ─────────────────────────────────────────────────────────────────
-    private void generateRegistrar(
-            TypeElement classElement,
-            List<ExecutableElement> methods,
-            TypeMirror targetClassMirror
-    ) {
-        String originalPackage   = processingEnv.getElementUtils()
-                .getPackageOf(classElement).getQualifiedName().toString();
-        String targetSimpleName  = getSimpleName(targetClassMirror);
-        String originalClassName = classElement.getSimpleName().toString();
-        ClassName actionResult   = ClassName.get("net.minecraft.util", "ActionResult");
+    /* ----------------------------------------------------------------------- */
+    /** Generates the registrar class that registers the callbacks. */
+    private void generateRegistrar(TypeElement classElement,
+                                   List<ExecutableElement> methods,
+                                   TypeMirror targetClassMirror) {
+        String originalPackage =
+                processingEnv.getElementUtils()
+                        .getPackageOf(classElement).getQualifiedName().toString();
+        String targetSimpleName = getSimpleName(targetClassMirror);
+        String originalClassName =
+                classElement.getSimpleName().toString();
 
         MethodSpec.Builder registerMethod = MethodSpec.methodBuilder("register")
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
                 .returns(void.class);
 
-        // Generate one EVENT.register(...) block per @HandleEvent method.
-        // Uses explicit lambda instead of method reference to avoid signature mismatch
-        // when injectSelf=true shifts the parameter count between callback and handler.
         for (ExecutableElement method : methods) {
             HandleEvent handleEvent  = method.getAnnotation(HandleEvent.class);
             String      methodName   = method.getSimpleName().toString();
-            String      callbackName = targetSimpleName + capitalize(handleEvent.nameMethod()) + "Callback";
+            String      callbackName = targetSimpleName + capitalize(handleEvent.nameMethod())
+                    + capitalize(handleEvent.position().getValue()) + "Callback";
             ClassName   callbackClass = ClassName.get(originalPackage + ".callback", callbackName);
 
             List<String> argNames = new ArrayList<>();
@@ -810,13 +1138,30 @@ public class AnnotationProcessor extends AbstractProcessor {
             }
             String argsJoined = String.join(", ", argNames);
 
-            CodeBlock registerBlock = CodeBlock.builder()
-                    .add("$T.EVENT.register(($L) -> {\n", callbackClass, argsJoined)
-                    .indent()
-                    .addStatement("return $T.$L($L)", classElement, methodName, argsJoined)
-                    .unindent()
-                    .add("});\n")
-                    .build();
+            CodeBlock.Builder registerBuilder = CodeBlock.builder()
+                    .add("$T.EVENT.register(($L) -> {\n",
+                            callbackClass,
+                            argsJoined)
+                    .indent();
+
+            if (method.getReturnType().getKind() == TypeKind.VOID) {
+                registerBuilder
+                        .addStatement("$T.$L($L)",
+                                classElement,
+                                methodName,
+                                argsJoined);
+            } else {
+                registerBuilder
+                        .addStatement("return $T.$L($L)",
+                                classElement,
+                                methodName,
+                                argsJoined);
+            }
+
+            registerBuilder.unindent()
+                    .add("});\n");
+
+            CodeBlock registerBlock = registerBuilder.build();
 
             registerMethod.addCode(registerBlock);
         }
@@ -826,17 +1171,14 @@ public class AnnotationProcessor extends AbstractProcessor {
                 .addMethod(registerMethod.build())
                 .build();
 
-        writeFileToClientSources(JavaFile.builder(originalPackage + ".registrar", registrarClass)
-                .indent("    ").skipJavaLangImports(true).build());
+        writeFileToClientSources(
+                JavaFile.builder(originalPackage + ".registrar",
+                                registrarClass)
+                        .indent("    ")
+                        .skipJavaLangImports(true).build());
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // HELPERS
-    // ─────────────────────────────────────────────────────────────────
-
-    // Safely extract the TypeMirror from a Class<?> annotation value.
-    // Direct access throws MirroredTypeException at compile time —
-    // catching it is the standard APT workaround.
+    /* ----------------------------------------------------------------------- */
     private TypeMirror getTargetClassMirror(FabricEvent annotation) {
         try {
             annotation.value();
@@ -846,14 +1188,52 @@ public class AnnotationProcessor extends AbstractProcessor {
         return null;
     }
 
-    // Extract the simple class name from a TypeMirror
+    /* ----------------------------------------------------------------------- */
     private String getSimpleName(TypeMirror mirror) {
         String full = mirror.toString();
         return full.substring(full.lastIndexOf('.') + 1);
     }
 
-    // Capitalizes the first letter of a string
+    /* ----------------------------------------------------------------------- */
     private String capitalize(String str) {
+        if (str == null || str.isEmpty()) return str;
         return str.substring(0, 1).toUpperCase() + str.substring(1);
+    }
+
+    /* ----------------------------------------------------------------------- */
+    /** Returns the default literal for a given type. */
+    private String defaultLiteralFor(TypeName type) {
+        if (type.equals(TypeName.BOOLEAN)) return "false";
+        if (type.equals(TypeName.INT)) return "0";
+        if (type.equals(TypeName.LONG)) return "0L";
+        if (type.equals(TypeName.FLOAT)) return "0.0f";
+        if (type.equals(TypeName.DOUBLE)) return "0.0d";
+        if (type.equals(TypeName.BYTE)) return "(byte)0";
+        if (type.equals(TypeName.SHORT)) return "(short)0";
+        if (type.equals(TypeName.CHAR)) return "'\\u0000'";
+        // For objects and wrapper types, null is a safe default
+        return "null";
+    }
+
+    /** Returns the boxed type for primitives. */
+    private TypeName boxedType(TypeName type) {
+        if (type.equals(TypeName.BOOLEAN))
+            return ClassName.get("java.lang", "Boolean");
+        if (type.equals(TypeName.INT))
+            return ClassName.get("java.lang", "Integer");
+        if (type.equals(TypeName.LONG))
+            return ClassName.get("java.lang", "Long");
+        if (type.equals(TypeName.FLOAT))
+            return ClassName.get("java.lang", "Float");
+        if (type.equals(TypeName.DOUBLE))
+            return ClassName.get("java.lang", "Double");
+        if (type.equals(TypeName.BYTE))
+            return ClassName.get("java.lang", "Byte");
+        if (type.equals(TypeName.SHORT))
+            return ClassName.get("java.lang", "Short");
+        if (type.equals(TypeName.CHAR))
+            return ClassName.get("java.lang", "Character");
+        // For other types, keep as is
+        return type;
     }
 }
