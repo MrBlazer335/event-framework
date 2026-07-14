@@ -117,6 +117,19 @@ dependencies {
     annotationProcessor 'io.github.YOUR_USERNAME:event-framework:VERSION'
 }
 ```
+### As a Maven dependency (via JitPack)
+
+```groovy
+repositories {
+  mavenCentral()
+  maven { url 'https://www.jitpack.io' }
+}
+
+dependencies {
+  //Your dependencies
+  implementation 'com.github.MrBlazer335.event-framework:AnnotationProcess:v1.0.0'
+}
+```
 
 After adding the dependency, make sure to rebuild the project (`./gradlew clean build`)
 so your IDE and Gradle both pick up the annotation processor.
