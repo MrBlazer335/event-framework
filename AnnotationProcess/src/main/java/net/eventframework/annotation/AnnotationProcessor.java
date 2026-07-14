@@ -158,7 +158,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         ExecutableElement targetMethod = targetMethods.getFirst();
         List<? extends VariableElement> handlerParams = method.getParameters();
         List<? extends VariableElement> targetParams  = targetMethod.getParameters();
-
+        boolean returnValue = handleEvent.captureReturnValue();
         boolean injectSelf = handleEvent.injectSelf();
 
         /* ---- special error for injectSelf without params -------------------------------- */
@@ -172,12 +172,58 @@ public class AnnotationProcessor extends AbstractProcessor {
             );
             return false;
         }
+        if (returnValue && targetMethods.getFirst().getReturnType().getKind().equals(TypeKind.VOID)){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue cannot be used with a void target method");
+            return false;
+        }
+        /* ---- special error for static with selfInject ----------------------- */
+        if (injectSelf && targetMethod.getModifiers().contains(Modifier.STATIC)){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "injectSelf cannot be used with static target methods");
+            return false;
+        }
+        if (returnValue && !handleEvent.position().equals(InjectionPosition.RETURN)){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue is only supported at RETURN");
+            return false;
+        }
+        if (returnValue && handlerParams.isEmpty()){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue requires the last handler parameter " +
+                                    "to accept the target method's return value");
+            return false;
+        }
+        if (returnValue) {
+            var lastHandlerParameter = handlerParams.getLast();
+            if (!processingEnv.getTypeUtils()
+                    .isAssignable(targetMethod.getReturnType(), lastHandlerParameter.asType())){
+                processingEnv.getMessager()
+                        .printMessage(Diagnostic.Kind.ERROR,
+                                "captureReturnValue requires the last handler parameter " +
+                                        "to accept the target method's return value");
+                return false;
+            }
+        }
 
         List<? extends VariableElement>
-                handlerParamsToCompare =
+                handlerParamsWithoutSelf =
                 injectSelf && !handlerParams.isEmpty()
                         ? handlerParams.subList(1, handlerParams.size())
                         : handlerParams;
+
+        // The trailing captured-return-value parameter (when captureReturnValue = true) is
+        // sourced from the mixin's CallbackInfoReturnable, not from the target method's own
+        // parameters — exclude it before comparing against the target method's parameter list.
+        List<? extends VariableElement>
+                handlerParamsToCompare =
+                returnValue && !handlerParamsWithoutSelf.isEmpty()
+                        ? handlerParamsWithoutSelf.subList(0, handlerParamsWithoutSelf.size() - 1)
+                        : handlerParamsWithoutSelf;
 
         if (handlerParamsToCompare.size() != targetParams.size()) {
             processingEnv.getMessager().printMessage(
@@ -945,6 +991,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         String targetMethodName = handleEvent.nameMethod();
         String position = handleEvent.position().getValue();
         boolean injectSelf = handleEvent.injectSelf();
+        boolean returnValue = handleEvent.captureReturnValue();
 
         TypeElement targetClassElement =
                 (TypeElement) processingEnv.getTypeUtils()
@@ -1028,13 +1075,27 @@ public class AnnotationProcessor extends AbstractProcessor {
 
         List<VariableElement> params =
                 new ArrayList<>(method.getParameters());
-        List<VariableElement> mixinParams = injectSelf ? params.subList(1, params.size()) : params;
+        List<VariableElement> paramsWithoutSelf =
+                injectSelf ? params.subList(1, params.size()) : params;
+
+        // The trailing captured-return-value parameter (when captureReturnValue = true) is not
+        // a real parameter of the injected mixin method — its value comes from
+        // ci.getReturnValue() instead, so it must not be declared here.
+        List<VariableElement> mixinParams =
+                returnValue && !paramsWithoutSelf.isEmpty()
+                        ? paramsWithoutSelf.subList(0, paramsWithoutSelf.size() - 1)
+                        : paramsWithoutSelf;
 
         MethodSpec.Builder methodBuilder = MethodSpec
                 .methodBuilder("on" + capitalize(targetMethodName))
                 .addAnnotation(injectAnnotation)
                 .addModifiers(Modifier.PRIVATE)
                 .returns(void.class);
+
+        // A mixin's @Inject method must match the staticness of the method it injects into.
+        if (targetMethod.getModifiers().contains(Modifier.STATIC)) {
+            methodBuilder.addModifiers(Modifier.STATIC);
+        }
 
         for (VariableElement param : mixinParams) {
             methodBuilder.addParameter(TypeName.get(param.asType()),
@@ -1047,6 +1108,9 @@ public class AnnotationProcessor extends AbstractProcessor {
         List<String> argNames = new ArrayList<>();
         for (VariableElement param : mixinParams) {
             argNames.add(param.getSimpleName().toString());
+        }
+        if (returnValue) {
+            argNames.add("ci.getReturnValue()");
         }
 
         String argsJoined;
