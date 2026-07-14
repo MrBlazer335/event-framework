@@ -22,4 +22,5 @@ public @interface HandleEvent {
     boolean returnable() default false;
 
     Class<?> returnType() default Void.class;
+    boolean captureReturnValue() default false;
 }

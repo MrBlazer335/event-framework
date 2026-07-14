@@ -158,7 +158,7 @@ public class AnnotationProcessor extends AbstractProcessor {
         ExecutableElement targetMethod = targetMethods.getFirst();
         List<? extends VariableElement> handlerParams = method.getParameters();
         List<? extends VariableElement> targetParams  = targetMethod.getParameters();
-
+        boolean returnValue = handleEvent.captureReturnValue();
         boolean injectSelf = handleEvent.injectSelf();
 
         /* ---- special error for injectSelf without params -------------------------------- */
@@ -170,6 +170,40 @@ public class AnnotationProcessor extends AbstractProcessor {
                             + targetClassMirror.toString(),
                     method
             );
+            return false;
+        }
+        if (returnValue && targetMethods.getFirst().getReturnType().getKind().equals(TypeKind.VOID)){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue cannot be used with a void target method");
+            return false;
+        }
+        /* ---- special error for static with selfInject ----------------------- */
+        if (injectSelf && targetMethod.getModifiers().contains(Modifier.STATIC)){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "injectSelf cannot be used with static target methods");
+            return false;
+        }
+        if (returnValue && !handleEvent.position().equals(InjectionPosition.RETURN)){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue is only supported at RETURN");
+            return false;
+        }
+        if (returnValue && handlerParams.isEmpty()){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue requires the last handler parameter " +
+                                    "to accept the target method's return value");
+            return false;
+        }
+        var lastHandlerParameter = handlerParams.getLast();
+        if (returnValue && !lastHandlerParameter.asType().equals(targetMethod.getReturnType())){
+            processingEnv.getMessager()
+                    .printMessage(Diagnostic.Kind.ERROR,
+                            "captureReturnValue requires the last handler parameter " +
+                                    "to accept the target method's return value");
             return false;
         }
 
